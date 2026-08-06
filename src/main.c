@@ -267,7 +267,7 @@ static void start_burst_rx( void )
     p->max_rx_size               = FLRC_BURST_PKT_PAYLOAD;
     p->burst_rx_size             = FLRC_BURST_MAX_TOTAL_PAYLOAD;
     p->rx_burst_timeout_margin_ms = 60000; /* 60-second RX window margin */
-    p->min_interframe_delay_us = 1500;
+    p->min_interframe_delay_us = 500;
 
     g_rac_ctx->smtc_rac_data_buffer_setup.rx_payload_buffer = g_rac_rx_pkt_buf;
     g_rac_ctx->smtc_rac_data_buffer_setup.size_of_rx_payload_buffer = sizeof( g_rac_rx_pkt_buf );
@@ -364,7 +364,7 @@ static void execute_burst_tx( void )
     p->sync_word[2]      = default_syncword_3;
     p->crc_seed          = 0xFFFFFFFF;
     p->crc_polynomial    = 0x755B;
-    p->min_interframe_delay_us = 1500;
+    p->min_interframe_delay_us = 500;
     p->max_rx_size       = FLRC_BURST_PKT_PAYLOAD;
     p->burst_tx_size     = g_tx_air_total_len;
 
