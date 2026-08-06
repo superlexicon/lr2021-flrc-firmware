@@ -1,0 +1,207 @@
+/*
+ * Device tree overlay for the Semtech LR2021 LoRa Plus Evaluation Kit.
+ *
+ * Hardware:
+ *   MCU     : Seeed XIAO nRF54L15   (xiao_nrf54l15_nrf54l15_cpuapp)
+ *   Radio   : Semtech Wio-LR2021 (LR20xx family) on the LoRa Plus expansion
+ *
+ * Apply with:
+ *   west build -b xiao_nrf54l15/nrf54l15/cpuapp -- \
+ *       -DDTC_OVERLAY_FILE=$(pwd)/overlay-xiao_nrf54l15_lr2021.dts
+ */
+
+#include <zephyr/dt-bindings/usp/lr20xx.h>
+
+/ {
+    chosen {
+        /* USP RAC binds the LR2021 through this chosen node. */
+        zephyr,lorawan-transceiver = &lr2021_radio;
+    };
+
+    aliases {
+        lora-transceiver = &lr2021_radio;
+    };
+};
+
+/* ---- Enable the Xiao SPI bus that talks to the LR2021 ------------------- */
+&xiao_spi {
+    status = "okay";
+    /* When MOSI is unused (RX-only) keep it driven; prevents floating input. */
+    overrun-character = <0>;
+    /* Single chip-select on Xiao D3, active low. */
+    cs-gpios = <&xiao_d 3 GPIO_ACTIVE_LOW>;
+
+    lr2021_radio: lora@0 {
+        compatible = "semtech,lr2021";
+        reg = <0>;
+        spi-max-frequency = <DT_FREQ_M(16)>;
+
+        /* Board-specific calibration offset (0 = use factory defaults). */
+        tx-power-offset = <0>;
+        /* Maximum RX boost (0..7). */
+        rx-boost-cfg = <7>;
+
+        /* ---- GPIO control lines ---- */
+        /* NRX / hardware reset : Xiao D2, active low. */
+        reset-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;
+        /* BUSY signal          : Xiao D1, active high, pulled up. */
+        busy-gpios = <&xiao_d 1 (GPIO_ACTIVE_HIGH | GPIO_PULL_UP)>;
+
+        /* ---- Power supply & clocking ---- */
+        reg-mode = <LR20XX_REG_MODE_DCDC>;
+        lf-clk   = <LR20XX_SYSTEM_LFCLK_RC>;
+        tcxo-voltage = <LR20XX_SYSTEM_TCXO_CTRL_1_8V>;
+        tcxo-wakeup-time = <0>;
+
+        /*
+         * TX power configuration table (sub-GHz / LF path), measured by
+         * Semtech at 902 MHz on the Wio-LR2021. Each row is:
+         *   <chip_half_pwr_cfg  pa_lf_duty_cycle  pa_lf_slices>
+         */
+        tx-power-cfg-lf =
+            <(-18) 0x03 0x06>,
+            <(-13) 0x02 0x05>,
+            <(-13) 0x06 0x01>,
+            <( -6) 0x06 0x00>,
+            <(  4) 0x01 0x00>,
+            <(  4) 0x02 0x00>,
+            <(  2) 0x01 0x03>,
+            <( 14) 0x00 0x00>,
+            <(  9) 0x00 0x03>,
+            <( 11) 0x03 0x00>,
+            <( 16) 0x01 0x00>,
+            <( 11) 0x07 0x00>,
+            <( 18) 0x02 0x00>,
+            <( 16) 0x05 0x00>,
+            <( 17) 0x07 0x00>,
+            <( 21) 0x01 0x02>,
+            <( 25) 0x03 0x00>,
+            <( 32) 0x00 0x01>,
+            <( 32) 0x02 0x00>,
+            <( 27) 0x03 0x01>,
+            <( 32) 0x02 0x01>,
+            <( 28) 0x05 0x01>,
+            <( 30) 0x05 0x01>,
+            <( 34) 0x04 0x01>,
+            <( 31) 0x05 0x04>,
+            <( 34) 0x04 0x04>,
+            <( 34) 0x05 0x06>,
+            <( 39) 0x03 0x05>,
+            <( 37) 0x06 0x06>,
+            <( 40) 0x05 0x05>,
+            <( 41) 0x07 0x04>,
+            <( 43) 0x07 0x04>,
+            <( 44) 0x07 0x07>;
+
+        /* Image-rejection calibration reference frequencies (Hz). */
+        calibration-freqs = <
+            870000000
+            920000000
+            2441000000
+        >;
+
+        /* Required TX/RX current tables from the official Wio-LR2021 shield DTSI. */
+        tx-power-cfg-hf =
+            <(-39) 29   0x07>,
+            <(-39) 16   0x07>,
+            <(-35) 19   0x07>,
+            <(-32) 19   0x07>,
+            <(-29) 19   0x07>,
+            <(-27) 16   0x07>,
+            <(-24) 17   0x07>,
+            <(-22) 16   0x07>,
+            <(-19) 18   0x07>,
+            <(-17) 16   0x07>,
+            <(-14) 21   0x07>,
+            <(-12) 18   0x07>,
+            <( -7) 30   0x07>,
+            <( -8) 16   0x07>,
+            <( -5) 24   0x07>,
+            <( -2) 27   0x07>,
+            <(  1) 29   0x07>,
+            <(  4) 30   0x07>,
+            <(  6) 30   0x07>,
+            <(  7) 28   0x07>,
+            <(  8) 25   0x07>,
+            <( 10) 25   0x07>,
+            <( 15) 31   0x07>,
+            <( 16) 30   0x07>,
+            <( 18) 30   0x07>,
+            <( 21) 31   0x07>,
+            <( 22) 30   0x07>,
+            <( 24) 30   0x07>,
+            <( 24) 26   0x07>,
+            <( 24) 16   0x07>;
+
+        tx-dbm-to-ua-reg-mode-dcdc-lf-vreg = <
+            10400 10100 9000 9000 8400 8700 10100 9200 10600 10000 10000 12100 10900 12000
+            13100 13300 13400 14600 15300 16800 18100 20200 21900 25600 28300 32200 37600
+            46000 51800 61300 74100 89400 108200
+        >;
+
+        tx-dbm-to-ua-reg-mode-ldo-lf-vreg = <
+            1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000
+            1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000
+            1000 1000 1000 1000 1000
+        >;
+
+        tx-dbm-to-ua-reg-mode-dcdc-hf-vreg = <
+            8625 8783 8874 8998 9145 9289 9481 9646 9840 10073 10280 10597 10511 11200
+            11391 11630 11360 11635 11986 12670 13292 13859 13685 14629 15388 15804
+            17270 18943 21041 22524
+        >;
+
+        rx-bw-to-ua-reg-mode-dcdc-lf-vreg = < 5700 5790 6320 6140 6840 6600 >;
+        rx-bw-to-ua-reg-mode-dcdc-hf-vreg = < 6400 6510 7040 6860 6880 7350 >;
+        rx-bw-to-ua-reg-mode-dcdc-lf-vreg-boosted = < 6920 6990 7530 7370 8160 7820 >;
+        rx-bw-to-ua-reg-mode-dcdc-hf-vreg-boosted = < 6740 6850 7130 7180 8010 7690 >;
+        rx-bw-to-ua-reg-mode-ldo-lf-vreg = < 9420 9580 10580 10240 11770 11130 >;
+        rx-bw-to-ua-reg-mode-ldo-hf-vreg = < 10760 10890 11870 11640 13130 12500 >;
+        rx-bw-to-ua-reg-mode-ldo-lf-vreg-boosted = < 11670 11710 12880 12560 14090 13500 >;
+        rx-bw-to-ua-reg-mode-ldo-hf-vreg-boosted = < 11410 11570 12590 12280 13720 13180 >;
+
+        /*
+         * DIO mapping for Wio-LR2021 shield:
+         * DIO 5: RF switch control (LF RX/TX & HF RX/TX)
+         * DIO 6: RF switch control (LF RX/TX & HF RX/TX)
+         * DIO 8 (DIO1): Radio IRQ -> Xiao D0
+         */
+        dios {
+            compatible = "semtech,lr20xx-dios";
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            dio@5 {
+                reg = <5>;
+                function = <LR20XX_SYSTEM_DIO_FUNC_RF_SWITCH>;
+                sleep-drive = <LR20XX_SYSTEM_DIO_DRIVE_PULL_UP>;
+                rf-sw = <(
+                    LR20XX_DIO_RF_SWITCH_WHEN_LF_RX | LR20XX_DIO_RF_SWITCH_WHEN_LF_TX |
+                    LR20XX_DIO_RF_SWITCH_WHEN_HF_RX | LR20XX_DIO_RF_SWITCH_WHEN_HF_TX
+                )>;
+            };
+
+            dio@6 {
+                reg = <6>;
+                function = <LR20XX_SYSTEM_DIO_FUNC_RF_SWITCH>;
+                sleep-drive = <LR20XX_SYSTEM_DIO_DRIVE_AUTO>;
+                rf-sw = <(
+                    LR20XX_DIO_RF_SWITCH_WHEN_LF_RX | LR20XX_DIO_RF_SWITCH_WHEN_LF_TX |
+                    LR20XX_DIO_RF_SWITCH_WHEN_HF_RX | LR20XX_DIO_RF_SWITCH_WHEN_HF_TX
+                )>;
+            };
+
+            dio@8 {
+                reg = <8>;
+                function = <LR20XX_SYSTEM_DIO_FUNC_IRQ>;
+                dio-gpios = <&xiao_d 0 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+                irq-mask = <LR20XX_SYSTEM_IRQ_ALL_MASK>;
+            };
+        };
+    };
+};
+
+/* ---- Free unused peripherals ---- */
+&i2c22 { status = "disabled"; };
+&i2c30 { status = "disabled"; };
+&adc   { status = "disabled"; };
