@@ -91,9 +91,9 @@ def main():
     cmd.extend(test_payload)
 
     print(f"Payload Size           : {PAYLOAD_SIZE} bytes ({PAYLOAD_SIZE * 8} bits)")
-    print(f"Configured Mod. Rate   : 2.600 Mbps raw (Coding Rate 3/4 -> 1.95 Mbps net)")
+    print(f"Configured Mod. Rate   : 2.600 Mbps raw (Coding Rate 1/1 -> 2.60 Mbps uncoded net)")
     print(f"Burst Fragment Sizing  : 4 fragments of 252 bytes (16B header + 236B chunk)")
-    print(f"Interframe Delay       : 1,500 us (1.5 ms) between fragments\n")
+    print(f"Interframe Delay       : 300 us (0.3 ms) between fragments\n")
 
     # Measure fast burst transmission (un-paced USB write)
     t0_tx = time.perf_counter()
@@ -133,9 +133,9 @@ def main():
     total_latency_ms = (t1_rx_received - t0_tx) * 1000.0
     air_plus_egress_ms = total_latency_ms - serial_write_time_ms
 
-    # Theoretical time calculation
-    # 4 packets * 0.85ms packet duration + 3 * 1.5ms interframe delay = 3.4ms + 4.5ms = 7.9ms
-    theoretical_toa_ms = (4 * 0.85) + (3 * 1.5)
+    # Theoretical time calculation for CR 1/1 (2.6 Mbps) + 300us interframe delay:
+    # 4 packets * 0.62ms packet duration + 3 * 0.3ms interframe delay = 2.48ms + 0.90ms = 3.38ms
+    theoretical_toa_ms = (4 * 0.62) + (3 * 0.30)
     theoretical_on_air_speed_kbps = (PAYLOAD_SIZE * 8) / (theoretical_toa_ms / 1000.0)
     theoretical_on_air_speed_kbs = theoretical_on_air_speed_kbps / 8.0
 

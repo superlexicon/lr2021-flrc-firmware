@@ -251,7 +251,7 @@ static void start_burst_rx( void )
     p->frequency_in_hz           = g_cfg.freq_hz;
     p->rx_frequency_offset_in_hz = 0;
     p->raw_bit_rate              = RAL_FLRC_RAW_BIT_RATE_2_600_MBPS;
-    p->cr                        = RAL_FLRC_CR_3_4;
+    p->cr                        = RAL_FLRC_CR_1_1;
     p->pulse_shape               = RAL_FLRC_PULSE_SHAPE_BT_05;
     p->preamble_len              = RAL_FLRC_PREAMBLE_LENGTH_32_BITS;
     p->sync_word_len             = RAL_FLRC_SYNCWORD_LENGTH_4_BYTES;
@@ -267,7 +267,7 @@ static void start_burst_rx( void )
     p->max_rx_size               = FLRC_BURST_PKT_PAYLOAD;
     p->burst_rx_size             = FLRC_BURST_MAX_TOTAL_PAYLOAD;
     p->rx_burst_timeout_margin_ms = 60000; /* 60-second RX window margin */
-    p->min_interframe_delay_us = 500;
+    p->min_interframe_delay_us = 300;
 
     g_rac_ctx->smtc_rac_data_buffer_setup.rx_payload_buffer = g_rac_rx_pkt_buf;
     g_rac_ctx->smtc_rac_data_buffer_setup.size_of_rx_payload_buffer = sizeof( g_rac_rx_pkt_buf );
@@ -351,7 +351,7 @@ static void execute_burst_tx( void )
     p->frequency_in_hz   = g_cfg.freq_hz;
     p->tx_power_in_dbm   = g_cfg.tx_pwr_dbm;
     p->raw_bit_rate      = RAL_FLRC_RAW_BIT_RATE_2_600_MBPS;
-    p->cr                = RAL_FLRC_CR_3_4;
+    p->cr                = RAL_FLRC_CR_1_1;
     p->pulse_shape       = RAL_FLRC_PULSE_SHAPE_BT_05;
     p->preamble_len      = RAL_FLRC_PREAMBLE_LENGTH_32_BITS;
     p->sync_word_len     = RAL_FLRC_SYNCWORD_LENGTH_4_BYTES;
@@ -364,7 +364,7 @@ static void execute_burst_tx( void )
     p->sync_word[2]      = default_syncword_3;
     p->crc_seed          = 0xFFFFFFFF;
     p->crc_polynomial    = 0x755B;
-    p->min_interframe_delay_us = 500;
+    p->min_interframe_delay_us = 300;
     p->max_rx_size       = FLRC_BURST_PKT_PAYLOAD;
     p->burst_tx_size     = g_tx_air_total_len;
 
