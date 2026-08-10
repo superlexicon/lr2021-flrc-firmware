@@ -111,7 +111,15 @@ static uint32_t g_slot_period_ms = 1000;  /* Default slot period (1 second) */
 /* TX: Application pending buffer */
 static uint8_t  g_pending_tx_buf[FLRC_BURST_MAX_TOTAL_PAYLOAD];
 static uint32_t g_pending_tx_len = 0;
+/* burst_id must be globally unique across all nodes so the multi-slot
+ * reassembly doesn't mix packets from different senders into the same slot.
+ * We offset each node's burst_id range by a per-node value derived from the
+ * sync_word (which is shared but we hash the CONFIG serial_port path... no,
+ * we don't have node identity at firmware level). Instead, we use a simple
+ * time-based randomization: XOR the incrementing counter with a boot-time
+ * random seed. This makes burst_ids from different nodes unlikely to collide. */
 static uint16_t g_pending_burst_id = 0;
+static uint16_t g_burst_id_offset  = 0; /* random offset set at boot */
 static bool     g_pending_tx_valid = false;
 static uint8_t  g_tx_repeat_count = 0;
 /* CSMA/CA backoff: the superloop won't request a TX until this time (ms) has
@@ -417,7 +425,7 @@ static void execute_burst_tx( void )
 
         flrc_packet_header_t hdr;
         hdr.magic             = sys_cpu_to_le16( FLRC_BURST_HEADER_MAGIC );
-        hdr.burst_id          = sys_cpu_to_le16( g_pending_burst_id );
+        hdr.burst_id          = sys_cpu_to_le16( g_pending_burst_id ^ g_burst_id_offset );
         hdr.packet_idx        = sys_cpu_to_le16( i );
         hdr.total_packets     = sys_cpu_to_le16( total_packets );
         hdr.total_payload_len = sys_cpu_to_le32( payload_len );
@@ -485,29 +493,14 @@ static void execute_burst_tx( void )
     g_rac_ctx->scheduler_config.callback_post_radio_transaction = rac_post_callback;
     g_rac_ctx->scheduler_config.callback_pre_radio_transaction  = NULL;
 
-    /* Enable Listen-Before-Talk for roles that may contend with peer TXs
-     * (Both, TxOnly). RxOnly never transmits so LBT is irrelevant.
-     * In dual-radio mode (TxOnly), the dedicated RX radio on each peer is
-     * always listening, but TX-TX collisions between nodes' TX radios are
-     * still possible — LBT prevents those. */
-    /* Enable LBT for single-radio (Both) mode only. In dual-radio mode
-     * (TxOnly + RxOnly), LBT is disabled because:
-     * - The TX radio's own initial RX (from init_radio) creates a carrier
-     *   that LBT detects as "busy", causing infinite backoff and frame drops.
-     * - The dedicated RX radio on each peer is always listening, so TX-TX
-     *   collisions between nodes are the only concern, and these are handled
-     *   by the firmware's burst reassembly (multi-slot concurrent). */
-    if( g_cfg.role == FLRC_ROLE_BOTH )
-    {
-        g_rac_ctx->lbt_context.lbt_enabled        = true;
-        g_rac_ctx->lbt_context.listen_duration_ms = 5;
-        g_rac_ctx->lbt_context.threshold_dbm      = -80;
-        g_rac_ctx->lbt_context.bandwidth_hz       = 1200000;
-    }
-    else
-    {
-        g_rac_ctx->lbt_context.lbt_enabled = false;
-    }
+    /* LBT enabled: carrier sense before TX prevents collisions between nodes.
+     * In Both mode, the radio's own RX is on the same channel, but LBT checks
+     * BEFORE aborting RX for TX — it sees the channel state at that instant.
+     * The 5ms listen window catches peer bursts that started just before. */
+    g_rac_ctx->lbt_context.lbt_enabled        = true;
+    g_rac_ctx->lbt_context.listen_duration_ms = 5;
+    g_rac_ctx->lbt_context.threshold_dbm      = -80;
+    g_rac_ctx->lbt_context.bandwidth_hz       = 1200000;
 
     g_burst_mode = BURST_TX;
     g_stats.bursts_tx++;
@@ -892,6 +885,12 @@ static int usb_rx_poll( void )
             {
                 g_pending_tx_len = frame_len;
                 g_pending_burst_id++;
+                /* Apply per-node random offset so different nodes don't
+                 * collide on the same burst_id. Without this, two nodes
+                 * incrementing from 0 produce overlapping burst_ids, and
+                 * the receiver's multi-slot reassembly mixes their packets
+                 * into the same slot → CRC failure on both. */
+                /* (actual offset applied at TX header build time) */
                 g_pending_tx_valid = true;
                 send_debug_event( 20, g_pending_tx_len ); /* Debug event 20: Payload enqueued */
                 LOG_INF( "Host payload buffered: %u bytes, burst_id=%u", g_pending_tx_len, g_pending_burst_id );
@@ -958,7 +957,12 @@ static int init_radio( void )
 
 int main( void )
 {
-    LOG_INF( "LR2021 FLRC hardware-burst bridge booting" );
+    /* Generate a per-boot random burst_id offset so different nodes don't
+     * collide on the same burst_id values. Uses the hardware timer as entropy. */
+    g_burst_id_offset = (uint16_t)( k_uptime_get_32() ^ ( k_uptime_get_32() >> 16 ) );
+    if( g_burst_id_offset == 0 ) g_burst_id_offset = 1;
+
+    LOG_INF( "LR2021 FLRC hardware-burst bridge booting (burst_id offset: 0x%04X)", g_burst_id_offset );
 
     if( usb_init( ) != 0 ) return 0;
     k_sleep( K_SECONDS( 1 ) );
