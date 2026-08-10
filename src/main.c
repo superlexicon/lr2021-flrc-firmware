@@ -104,6 +104,13 @@ typedef enum {
 static volatile burst_mode_t g_burst_mode = BURST_RX;
 static volatile bool         g_restart_rx_pending = false;
 
+/* TX watchdog: if a TX burst doesn't complete within this timeout, abort
+ * and restart. The RAC engine's TX transaction can hang after sustained
+ * operation (~115s). Without a watchdog, g_burst_mode stays BURST_TX
+ * forever, blocking all further TX and RX. */
+#define TX_WATCHDOG_TIMEOUT_MS  5000
+static volatile uint32_t g_tx_start_time_ms = 0;
+
 /* Transmit Window Configuration */
 static uint32_t g_slot_offset_ms = 100;   /* Default slot offset within epoch */
 static uint32_t g_slot_period_ms = 1000;  /* Default slot period (1 second) */
@@ -324,14 +331,23 @@ static void send_rx_packet( const uint8_t* payload, uint16_t len, int16_t rssi )
 
 static void send_stats_packet( void )
 {
-    uint8_t header[3] = { FLRC_MSG_STATS, 24, 0 };
-    uint8_t stats_bytes[24];
+    /* Extended stats: 24 bytes original + 16 bytes diagnostic = 40 bytes */
+    uint8_t header[3] = { FLRC_MSG_STATS, 40, 0 };
+    uint8_t stats_bytes[40];
     sys_put_le32( g_stats.bursts_tx, &stats_bytes[0] );
     sys_put_le32( g_stats.bursts_rx, &stats_bytes[4] );
     sys_put_le32( g_stats.packets_tx, &stats_bytes[8] );
     sys_put_le32( g_stats.packets_rx, &stats_bytes[12] );
     sys_put_le32( g_stats.crc_errors, &stats_bytes[16] );
     sys_put_le32( g_stats.host_tx_dropped, &stats_bytes[20] );
+    /* Diagnostic fields for TX degradation investigation */
+    stats_bytes[24] = (uint8_t) g_burst_mode;           /* 0=RX, 1=ABORTING, 2=TX */
+    stats_bytes[25] = g_tx_repeat_count;                 /* LBT backoff counter */
+    stats_bytes[26] = g_pending_tx_valid ? 1 : 0;        /* TX payload pending? */
+    stats_bytes[27] = g_restart_rx_pending ? 1 : 0;      /* RX restart needed? */
+    sys_put_le32( smtc_modem_hal_get_time_in_ms( ) - g_tx_backoff_until_ms, &stats_bytes[28] ); /* ms until backoff clears (negative if past) */
+    sys_put_le32( smtc_modem_hal_get_time_in_ms( ), &stats_bytes[32] );  /* current MCU time */
+    sys_put_le32( g_stats.packets_rx, &stats_bytes[36] ); /* placeholder for future use */
     queue_host_tx( header, 3, stats_bytes, sizeof( stats_bytes ), NULL, 0 );
 }
 
@@ -378,7 +394,9 @@ static void start_burst_rx( void )
     g_rac_ctx->smtc_rac_data_buffer_setup.size_of_rx_payload_buffer = sizeof( g_rac_rx_pkt_buf );
 
     g_rac_ctx->scheduler_config.scheduling    = SMTC_RAC_ASAP_TRANSACTION;
-    g_rac_ctx->scheduler_config.start_time_ms = 0;
+    /* Use current time — same fix as TX: prevents the 128s failsafe from
+     * triggering based on boot time for long-running RX transactions. */
+    g_rac_ctx->scheduler_config.start_time_ms = smtc_modem_hal_get_time_in_ms( );
     g_rac_ctx->scheduler_config.callback_post_radio_transaction = rac_post_callback;
     g_rac_ctx->scheduler_config.callback_pre_radio_transaction  = NULL;
 
@@ -495,7 +513,11 @@ static void execute_burst_tx( void )
     }
 
     g_rac_ctx->scheduler_config.scheduling    = SMTC_RAC_ASAP_TRANSACTION;
-    g_rac_ctx->scheduler_config.start_time_ms = 0;
+    /* Use current time as start_time_ms. The radio planner's failsafe checks
+     * start_time_ms + 128000 < now to detect stuck tasks. With start_time_ms=0
+     * (boot time), ANY running task triggers the failsafe after 128s of uptime.
+     * Using current time ensures the failsafe window is relative to each TX. */
+    g_rac_ctx->scheduler_config.start_time_ms = smtc_modem_hal_get_time_in_ms( );
     g_rac_ctx->scheduler_config.callback_post_radio_transaction = rac_post_callback;
     g_rac_ctx->scheduler_config.callback_pre_radio_transaction  = NULL;
 
@@ -509,6 +531,7 @@ static void execute_burst_tx( void )
     g_rac_ctx->lbt_context.bandwidth_hz       = 1200000;
 
     g_burst_mode = BURST_TX;
+    g_tx_start_time_ms = smtc_modem_hal_get_time_in_ms( );
     g_stats.bursts_tx++;
 
     smtc_rac_return_code_t rc = smtc_rac_submit_radio_transaction( g_radio_access_id );
@@ -1018,6 +1041,26 @@ int main( void )
             }
 
             ( void ) smtc_rac_run_engine( );
+
+            /* TX watchdog: if a TX burst hasn't completed within the timeout,
+             * the RAC engine's TX transaction has hung (observed after ~115s
+             * of sustained operation). Abort the stuck transaction and return
+             * to RX mode so the radio can recover. Without this, g_burst_mode
+             * stays BURST_TX forever and all TX/RX stops. */
+            if( g_burst_mode == BURST_TX )
+            {
+                uint32_t tx_elapsed = smtc_modem_hal_get_time_in_ms( ) - g_tx_start_time_ms;
+                if( tx_elapsed > TX_WATCHDOG_TIMEOUT_MS )
+                {
+                    LOG_INF( "TX watchdog: aborting stuck TX burst (elapsed=%ums)", tx_elapsed );
+                    g_pending_tx_valid = false;
+                    g_pending_tx_len   = 0;
+                    g_tx_repeat_count  = 0;
+                    g_burst_mode       = BURST_RX;
+                    g_restart_rx_pending = true;
+                    ( void ) smtc_rac_abort_radio_submit( g_radio_access_id );
+                }
+            }
 
             /* Emit periodic stats every 10s so the host can track counter
              * evolution (especially host_tx_dropped) without polling. */
