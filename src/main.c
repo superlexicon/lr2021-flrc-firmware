@@ -938,17 +938,21 @@ static int usb_rx_poll( void )
                 g_pending_tx_valid = true;
 
                 /* TDMA: pick a random slot within the current epoch.
-                 * The TX trigger will wait until this slot's time window
-                 * before transmitting, preventing collisions with other
-                 * nodes that picked different slots. */
+                 * Use the per-boot random offset + burst_id as entropy so
+                 * different nodes pick different slots even if they send
+                 * TX commands at the same time. */
                 uint32_t now_ms = smtc_modem_hal_get_time_in_ms( );
                 uint32_t slot_count = g_tdma_epoch_ms / g_tdma_slot_width_ms;
                 if( slot_count > 0 )
                 {
                     uint32_t epoch_start = now_ms - ( now_ms % g_tdma_epoch_ms );
-                    uint32_t slot = now_ms % slot_count;  /* pseudo-random slot */
+                    /* XOR burst_id with boot-time random offset for per-node
+                     * uniqueness, then mix in uptime for variation per TX. */
+                    uint32_t entropy = ( g_pending_burst_id ^ g_burst_id_offset )
+                                       ^ ( now_ms >> 3 );
+                    uint32_t slot = entropy % slot_count;
                     g_tdma_tx_slot_ms = epoch_start + ( slot * g_tdma_slot_width_ms );
-                    /* If the slot already passed this epoch, push to next epoch */
+                    /* If the slot already passed this epoch, use next epoch */
                     if( g_tdma_tx_slot_ms <= now_ms )
                     {
                         g_tdma_tx_slot_ms += g_tdma_epoch_ms;
