@@ -129,6 +129,12 @@ static uint32_t g_tx_backoff_until_ms = 0;
 /* One-time flag: TxOnly radio needs to abort the initial RX once. */
 static bool     g_tx_only_rx_aborted = false;
 
+/* Periodic stats emission: every 10s, emit a stats packet so the host
+ * can track counter evolution (bursts_tx/rx, host_tx_dropped, etc.)
+ * without polling. This is critical for diagnosing delivery degradation. */
+#define STATS_EMIT_INTERVAL_MS  10000
+static uint32_t g_last_stats_emit_ms = 0;
+
 /* TX: On-air formatted burst buffer (array of 511-byte packets) */
 #define MAX_AIR_PACKETS ((FLRC_BURST_MAX_TOTAL_PAYLOAD + FLRC_MAX_PACKET_CHUNK_SIZE - 1) / FLRC_MAX_PACKET_CHUNK_SIZE)
 static uint8_t  g_tx_air_packets[MAX_AIR_PACKETS][FLRC_BURST_PKT_PAYLOAD];
@@ -823,6 +829,12 @@ static int usb_rx_poll( void )
                 state = RX_STATE_LEN_LO;
                 have = 0;
             }
+            else if( tag == FLRC_MSG_STATS )
+            {
+                /* Host requests a stats snapshot. Respond immediately
+                 * via the deferred queue (non-blocking). */
+                send_stats_packet( );
+            }
             break;
 
         case RX_STATE_TX_MAGIC:
@@ -970,6 +982,7 @@ int main( void )
     if( init_radio( ) == 0 )
     {
         g_radio_ok = true;
+        g_last_stats_emit_ms = smtc_modem_hal_get_time_in_ms( );
         send_ready( );
     }
     else
@@ -1005,6 +1018,17 @@ int main( void )
             }
 
             ( void ) smtc_rac_run_engine( );
+
+            /* Emit periodic stats every 10s so the host can track counter
+             * evolution (especially host_tx_dropped) without polling. */
+            {
+                uint32_t now_ms = smtc_modem_hal_get_time_in_ms( );
+                if( now_ms - g_last_stats_emit_ms >= STATS_EMIT_INTERVAL_MS )
+                {
+                    g_last_stats_emit_ms = now_ms;
+                    send_stats_packet( );
+                }
+            }
 
             /* Drain ONE deferred host-TX frame per loop iteration, AFTER the
              * radio engine has run. This performs the (slow) byte-polled USB

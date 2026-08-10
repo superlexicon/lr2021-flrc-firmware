@@ -172,10 +172,11 @@ def send_tx(radio, payload):
 # RX frame parser
 # ---------------------------------------------------------------------------
 
-def parse_rx_frames(radio):
+def parse_rx_frames(radio, stats_list=None):
     """Parse all complete RX frames from the buffer.
 
-    Returns a list of (timestamp, payload_len, rssi, payload) tuples.
+    Returns a list of (timestamp, payload_len, rssi, payload) tuples for RX
+    frames. Stats frames ('S') are parsed and appended to stats_list if provided.
     Consumes parsed bytes from the buffer.
     """
     results = []
@@ -193,6 +194,33 @@ def parse_rx_frames(radio):
                 i += total_needed
             else:
                 break  # incomplete — wait for more data
+        elif tag == ord('S') and i + 3 <= len(buf):
+            # Stats frame: 'S' + len_lo + len_hi + 24 bytes of stats
+            slen = struct.unpack('<H', buf[i+1:i+3])[0]
+            if slen >= 24 and i + 3 + slen <= len(buf):
+                raw = buf[i+3:i+3+slen]
+                bursts_tx, bursts_rx, packets_tx, packets_rx, \
+                    crc_errors, host_tx_dropped = struct.unpack('<6I', raw[:24])
+                stats_entry = {
+                    'timestamp': time.time(),
+                    'bursts_tx': bursts_tx,
+                    'bursts_rx': bursts_rx,
+                    'packets_tx': packets_tx,
+                    'packets_rx': packets_rx,
+                    'crc_errors': crc_errors,
+                    'host_tx_dropped': host_tx_dropped,
+                }
+                if stats_list is not None:
+                    stats_list.append(stats_entry)
+                elapsed = stats_entry['timestamp'] - radio.start_time if hasattr(radio, 'start_time') else 0
+                print(f"  [{radio.name} STATS] tx_bursts={bursts_tx} rx_bursts={bursts_rx} "
+                      f"tx_pkts={packets_tx} rx_pkts={packets_rx} "
+                      f"crc_err={crc_errors} dropped={host_tx_dropped}")
+                i += 3 + slen
+            elif i + 3 + slen > len(buf):
+                break  # incomplete
+            else:
+                i += 3 + slen
         elif tag == ord('G') and i + 3 <= len(buf):
             i += 3  # READY, skip
         elif tag == ord('E') and i + 3 <= len(buf):
@@ -215,17 +243,21 @@ def parse_rx_frames(radio):
 # TX loop
 # ---------------------------------------------------------------------------
 
-def run_tx_loop(radio, duration_s, interval_ms, node_id, shared_radio=None):
+def run_tx_loop(radio, duration_s, interval_ms, node_id, shared_radio=None,
+                stats_list=None):
     """Continuously TX payloads cycling through PAYLOAD_SIZES.
 
     If shared_radio is set (same RadioPort as RX), TX is interleaved with
     RX parsing in the same thread to avoid two threads competing for one
     serial port.
+    Also parses incoming serial data for firmware stats frames (periodic
+    emission every 10s), appending to stats_list if provided.
     """
     deadline = time.time() + duration_s
     tx_count = 0
     size_idx = 0
     interval_s = interval_ms / 1000.0
+    radio.start_time = deadline - duration_s
 
     while time.time() < deadline:
         size = PAYLOAD_SIZES[size_idx % len(PAYLOAD_SIZES)]
@@ -245,14 +277,23 @@ def run_tx_loop(radio, duration_s, interval_ms, node_id, shared_radio=None):
             packets = (size + 236 - 1) // 236
             print(f"  [{elapsed}s] TX #{tx_count}: {size}B ({packets}pkt)")
 
-        # In shared mode, parse RX during the sleep window
-        if shared_radio:
-            t_end = time.time() + interval_s
-            while time.time() < t_end:
-                parse_rx_frames(shared_radio)
-                time.sleep(0.01)
-        else:
-            time.sleep(interval_s)
+        # Parse incoming serial data (stats frames, READY frames) during sleep
+        t_end = time.time() + interval_s
+        while time.time() < t_end:
+            # Always parse for stats (even in TX-only mode, the firmware
+            # emits periodic stats that arrive in the reader buffer)
+            parse_rx_frames(radio, stats_list=stats_list)
+            if shared_radio:
+                # In shared mode, also capture RX frames
+                pass  # parse_rx_frames already handles everything
+            time.sleep(0.01)
+
+        # Every 10 TXs, explicitly poll stats by sending 'S' command
+        if tx_count % 10 == 0:
+            radio.ser.write(b'S')
+            radio.ser.flush()
+            time.sleep(0.1)
+            parse_rx_frames(radio, stats_list=stats_list)
 
     return tx_count
 
@@ -261,16 +302,18 @@ def run_tx_loop(radio, duration_s, interval_ms, node_id, shared_radio=None):
 # RX logger
 # ---------------------------------------------------------------------------
 
-def run_rx_logger(radio, duration_s, results_list):
+def run_rx_logger(radio, duration_s, results_list, stats_list=None):
     """Continuously parse and log RX frames with timestamps.
 
     Appends (timestamp, plen, rssi, crc_ok) to results_list.
+    Appends stats dicts to stats_list if provided.
     """
     deadline = time.time() + duration_s
     last_report = time.time()
+    radio.start_time = deadline - duration_s
 
     while time.time() < deadline:
-        new_frames = parse_rx_frames(radio)
+        new_frames = parse_rx_frames(radio, stats_list=stats_list)
         for ts, plen, rssi, payload in new_frames:
             # Verify CRC if the payload is large enough to have a trailer
             if plen >= 4:
@@ -381,7 +424,9 @@ def main():
 
     tx_radio = None
     rx_radio = None
-    rx_frames = []  # list of (timestamp, plen, rssi, crc_ok)
+    rx_frames = []    # list of (timestamp, plen, rssi, crc_ok)
+    rx_stats = []     # list of stats dicts from firmware (RX radio)
+    tx_stats = []     # list of stats dicts from firmware (TX radio)
 
     try:
         # ── Determine mode ─────────────────────────────────────────────
@@ -440,8 +485,9 @@ def main():
                     nonlocal tx_count
                     tx_count = run_tx_loop(
                         tx_radio, args.duration, args.interval,
-                        args.node_id, shared_radio=rx_radio)
-                    # Drain remaining RX after TX loop ends
+                        args.node_id, shared_radio=rx_radio,
+                        stats_list=tx_stats)
+                    # Drain remaining after TX loop ends
                     if rx_radio:
                         for ts, plen, rssi, payload in parse_rx_frames(rx_radio):
                             if plen >= 4:
@@ -457,14 +503,15 @@ def main():
                 def tx_thread():
                     nonlocal tx_count
                     tx_count = run_tx_loop(tx_radio, args.duration,
-                                           args.interval, args.node_id)
+                                           args.interval, args.node_id,
+                                           stats_list=tx_stats)
                 t = threading.Thread(target=tx_thread, daemon=True)
                 threads.append(t)
                 t.start()
 
         if rx_radio and not shared_port:
             def rx_thread():
-                run_rx_logger(rx_radio, args.duration, rx_frames)
+                run_rx_logger(rx_radio, args.duration, rx_frames, stats_list=rx_stats)
             t = threading.Thread(target=rx_thread, daemon=True)
             threads.append(t)
             t.start()
@@ -480,6 +527,30 @@ def main():
         if rx_radio and rx_frames:
             print_report(rx_frames, args.duration, tx_count)
         elif tx_radio:
+            print(f"TX-only mode: sent {tx_count} payloads in {elapsed:.1f}s")
+        else:
+            print("No frames received.")
+
+        # Print stats evolution from whichever radios we have
+        all_stats = []
+        if tx_stats:
+            all_stats.append(("TX", tx_stats))
+        if rx_stats:
+            all_stats.append(("RX", rx_stats))
+
+        for label, stats in all_stats:
+            if stats:
+                print(f"\n{'='*70}")
+                print(f" {label} FIRMWARE STATS EVOLUTION")
+                print(f"{'='*70}")
+                print(f"  {'Time':>6s}  {'TX_burst':>8s}  {'RX_burst':>8s}  "
+                      f"{'TX_pkt':>8s}  {'RX_pkt':>8s}  {'CRC_err':>7s}  {'Dropped':>7s}")
+                start_ts = stats[0]['timestamp']
+                for s in stats:
+                    elapsed_t = s['timestamp'] - start_ts
+                    print(f"  {elapsed_t:5.0f}s  {s['bursts_tx']:8d}  {s['bursts_rx']:8d}  "
+                          f"{s['packets_tx']:8d}  {s['packets_rx']:8d}  "
+                          f"{s['crc_errors']:7d}  {s['host_tx_dropped']:7d}")
             print(f"TX-only mode: sent {tx_count} payloads in {elapsed:.1f}s")
         else:
             print("No frames received.")
