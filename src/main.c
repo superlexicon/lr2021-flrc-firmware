@@ -111,21 +111,9 @@ static volatile bool         g_restart_rx_pending = false;
 #define TX_WATCHDOG_TIMEOUT_MS  5000
 static volatile uint32_t g_tx_start_time_ms = 0;
 
-/* Transmit Window Configuration — TDMA slot scheduling.
- *
- * Each consensus epoch is divided into slots sized to fit one burst TX
- * (~5ms for a 4-packet burst including LBT + interframe delays). With a
- * 1-second epoch, that gives ~200 slots. Each node randomly picks one
- * slot per TX, so with 3 nodes the collision probability is ~0.015%.
- *
- * Configured by the host via SET_WINDOW ('W') command:
- *   bytes 0-3: tdma_epoch_ms (LE32)
- *   bytes 4-7: tdma_slot_width_ms (LE32) — width of each slot
- * The firmware computes slot_count = epoch / slot_width.
- */
-static uint32_t g_tdma_epoch_ms      = 1000; /* epoch length (default 1s) */
-static uint32_t g_tdma_slot_width_ms = 5;    /* slot width (default 5ms per burst) */
-static uint32_t g_tdma_tx_slot_ms    = 0;    /* absolute time (ms) when assigned slot starts */
+/* Transmit Window Configuration */
+static uint32_t g_slot_offset_ms = 100;   /* Default slot offset within epoch */
+static uint32_t g_slot_period_ms = 1000;  /* Default slot period (1 second) */
 
 /* TX: Application pending buffer */
 static uint8_t  g_pending_tx_buf[FLRC_BURST_MAX_TOTAL_PAYLOAD];
@@ -888,12 +876,9 @@ static int usb_rx_poll( void )
             window_body[have++] = b;
             if( have >= 8 )
             {
-                g_tdma_epoch_ms      = sys_get_le32( &window_body[0] );
-                g_tdma_slot_width_ms = sys_get_le32( &window_body[4] );
-                if( g_tdma_slot_width_ms == 0 ) g_tdma_slot_width_ms = 5;
-                LOG_INF( "TDMA: epoch=%u ms, slot_width=%u ms (%u slots/epoch)",
-                         g_tdma_epoch_ms, g_tdma_slot_width_ms,
-                         g_tdma_epoch_ms / g_tdma_slot_width_ms );
+                g_slot_offset_ms = sys_get_le32( &window_body[0] );
+                g_slot_period_ms = sys_get_le32( &window_body[4] );
+                LOG_INF( "Window set: offset=%u ms, period=%u ms", g_slot_offset_ms, g_slot_period_ms );
                 send_ready( );
                 state = RX_STATE_TAG;
             }
@@ -935,33 +920,15 @@ static int usb_rx_poll( void )
             {
                 g_pending_tx_len = frame_len;
                 g_pending_burst_id++;
+                /* Apply per-node random offset so different nodes don't
+                 * collide on the same burst_id. Without this, two nodes
+                 * incrementing from 0 produce overlapping burst_ids, and
+                 * the receiver's multi-slot reassembly mixes their packets
+                 * into the same slot → CRC failure on both. */
+                /* (actual offset applied at TX header build time) */
                 g_pending_tx_valid = true;
-
-                /* TDMA: pick a random slot within the current epoch.
-                 * The TX trigger will wait until this slot's time window
-                 * before transmitting, preventing collisions with other
-                 * nodes that picked different slots. */
-                uint32_t now_ms = smtc_modem_hal_get_time_in_ms( );
-                uint32_t slot_count = g_tdma_epoch_ms / g_tdma_slot_width_ms;
-                if( slot_count > 0 )
-                {
-                    uint32_t epoch_start = now_ms - ( now_ms % g_tdma_epoch_ms );
-                    uint32_t slot = now_ms % slot_count;  /* pseudo-random slot */
-                    g_tdma_tx_slot_ms = epoch_start + ( slot * g_tdma_slot_width_ms );
-                    /* If the slot already passed this epoch, push to next epoch */
-                    if( g_tdma_tx_slot_ms <= now_ms )
-                    {
-                        g_tdma_tx_slot_ms += g_tdma_epoch_ms;
-                    }
-                }
-                else
-                {
-                    g_tdma_tx_slot_ms = 0;  /* no TDMA — TX immediately */
-                }
-
-                send_debug_event( 20, g_pending_tx_len );
-                LOG_INF( "Host payload buffered: %u bytes, burst_id=%u, TDMA slot at %u ms",
-                         g_pending_tx_len, g_pending_burst_id, g_tdma_tx_slot_ms );
+                send_debug_event( 20, g_pending_tx_len ); /* Debug event 20: Payload enqueued */
+                LOG_INF( "Host payload buffered: %u bytes, burst_id=%u", g_pending_tx_len, g_pending_burst_id );
                 state = RX_STATE_TAG;
             }
             break;
@@ -1064,12 +1031,11 @@ int main( void )
 
             /* TX trigger — only for roles that transmit (Both, TxOnly).
              * RxOnly never transmits.
-             * TDMA: wait until the assigned slot time before TX to prevent
-             * collisions with other nodes. */
+             * For TxOnly: the initial RX (on default freq) is automatically
+             * aborted by request_burst_tx() when the first TX is queued. */
             if( g_cfg.role != FLRC_ROLE_RX_ONLY &&
                 g_pending_tx_valid && g_burst_mode == BURST_RX &&
-                smtc_modem_hal_get_time_in_ms( ) >= g_tx_backoff_until_ms &&
-                smtc_modem_hal_get_time_in_ms( ) >= g_tdma_tx_slot_ms )
+                smtc_modem_hal_get_time_in_ms( ) >= g_tx_backoff_until_ms )
             {
                 request_burst_tx( );
             }
