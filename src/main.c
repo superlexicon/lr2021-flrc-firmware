@@ -490,7 +490,14 @@ static void execute_burst_tx( void )
      * In dual-radio mode (TxOnly), the dedicated RX radio on each peer is
      * always listening, but TX-TX collisions between nodes' TX radios are
      * still possible — LBT prevents those. */
-    if( g_cfg.role != FLRC_ROLE_RX_ONLY )
+    /* Enable LBT for single-radio (Both) mode only. In dual-radio mode
+     * (TxOnly + RxOnly), LBT is disabled because:
+     * - The TX radio's own initial RX (from init_radio) creates a carrier
+     *   that LBT detects as "busy", causing infinite backoff and frame drops.
+     * - The dedicated RX radio on each peer is always listening, so TX-TX
+     *   collisions between nodes are the only concern, and these are handled
+     *   by the firmware's burst reassembly (multi-slot concurrent). */
+    if( g_cfg.role == FLRC_ROLE_BOTH )
     {
         g_rac_ctx->lbt_context.lbt_enabled        = true;
         g_rac_ctx->lbt_context.listen_duration_ms = 5;
@@ -712,8 +719,15 @@ static void rac_post_callback( rp_status_t status )
             uint32_t backoff_ms  = 1 + ( smtc_modem_hal_get_time_in_ms( ) % max_backoff );
             g_tx_backoff_until_ms = smtc_modem_hal_get_time_in_ms( ) + backoff_ms;
         }
-        g_burst_mode         = BURST_RX;
-        g_restart_rx_pending = true;
+        /* For TxOnly: stay in BURST_RX so the TX trigger can retry after
+         * backoff. Don't set g_restart_rx_pending (the main loop skips RX
+         * restart for TxOnly anyway, and setting it is misleading).
+         * For Both/RxOnly: restart RX to keep listening. */
+        g_burst_mode = BURST_RX;
+        if( g_cfg.role != FLRC_ROLE_TX_ONLY )
+        {
+            g_restart_rx_pending = true;
+        }
         break;
 
     case RP_STATUS_RADIO_UNLOCKED:
