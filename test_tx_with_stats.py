@@ -75,15 +75,26 @@ def poll_stats(ser):
     data = ser.read(4096)
     i = 0
     while i < len(data):
-        if data[i] == ord('S') and i + 27 <= len(data):
+        if data[i] == ord('S') and i + 3 <= len(data):
             slen = struct.unpack('<H', data[i+1:i+3])[0]
             if slen >= 24 and i + 3 + slen <= len(data):
                 vals = struct.unpack('<6I', data[i+3:i+27])
-                return {
+                result = {
                     'bursts_tx': vals[0], 'bursts_rx': vals[1],
                     'packets_tx': vals[2], 'packets_rx': vals[3],
                     'crc_errors': vals[4], 'host_tx_dropped': vals[5],
                 }
+                # Parse extended diagnostic fields (40-byte stats)
+                if slen >= 40:
+                    diag = data[i+3:i+3+slen]
+                    result['burst_mode'] = diag[24]      # 0=RX, 1=ABORTING, 2=TX
+                    result['tx_repeat'] = diag[25]       # LBT backoff counter
+                    result['tx_pending'] = diag[26]      # TX payload pending
+                    result['rx_restart'] = diag[27]      # RX restart needed
+                    backoff_signed = struct.unpack('<i', diag[28:32])[0]
+                    result['backoff_ms'] = backoff_signed  # ms since backoff cleared
+                    result['mcu_time_ms'] = struct.unpack('<I', diag[32:36])[0]
+                return result
             i += 1
         else:
             i += 1
@@ -150,10 +161,13 @@ def main():
                 s['tx_count'] = tx_count
                 stats_history.append(s)
                 elapsed = time.time() - start_time
+                mode_str = {0: "RX", 1: "ABORT", 2: "TX"}.get(s.get('burst_mode', -1), "?")
                 print(f"  [{elapsed:5.0f}s] TX#{tx_count:3d} STATS: "
-                      f"tx_bursts={s['bursts_tx']:5d} rx_bursts={s['bursts_rx']:5d} "
-                      f"tx_pkts={s['packets_tx']:5d} rx_pkts={s['packets_rx']:5d} "
-                      f"crc_err={s['crc_errors']:4d} dropped={s['host_tx_dropped']:4d}")
+                      f"tx={s['bursts_tx']:4d} rx={s['bursts_rx']:4d} "
+                      f"drop={s['host_tx_dropped']:3d} "
+                      f"mode={mode_str:5s} rpt={s.get('tx_repeat',0):2d} "
+                      f"pend={s.get('tx_pending',0)} restart={s.get('rx_restart',0)} "
+                      f"bkoff={s.get('backoff_ms',0):6d}ms")
 
         if tx_count % 30 == 0:
             elapsed = int(time.time() - start_time)
@@ -177,15 +191,17 @@ def main():
         print(" TX FIRMWARE STATS EVOLUTION")
         print(f"{'='*70}")
         print(f"  {'Time':>6s}  {'TX#':>4s}  {'TX_burst':>8s}  {'RX_burst':>8s}  "
-              f"{'TX_pkt':>8s}  {'RX_pkt':>8s}  {'CRC_err':>7s}  {'Dropped':>7s}  {'Delta':>6s}")
+              f"{'CRC_err':>7s}  {'Dropped':>7s}  {'Delta':>6s}  {'Mode':>5s}  {'Rpt':>3s}  {'Pend':>4s}  {'Bkoff_ms':>9s}")
         prev_bursts = 0
         for s in stats_history:
             elapsed = s['timestamp'] - start_time
             delta = s['bursts_tx'] - prev_bursts
             prev_bursts = s['bursts_tx']
+            mode_str = {0: "RX", 1: "ABORT", 2: "TX"}.get(s.get('burst_mode', -1), "?")
             print(f"  {elapsed:5.0f}s  {s['tx_count']:4d}  {s['bursts_tx']:8d}  {s['bursts_rx']:8d}  "
-                  f"{s['packets_tx']:8d}  {s['packets_rx']:8d}  "
-                  f"{s['crc_errors']:7d}  {s['host_tx_dropped']:7d}  +{delta:5d}")
+                  f"{s['crc_errors']:7d}  {s['host_tx_dropped']:7d}  +{delta:5d}  "
+                  f"{mode_str:>5s}  {s.get('tx_repeat',0):3d}  {s.get('tx_pending',0):4d}  "
+                  f"{s.get('backoff_ms',0):9d}")
 
     ser.close()
     print(f"\nDone. Sent {tx_count} TX payloads in {time.time() - start_time:.1f}s.")
