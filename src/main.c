@@ -219,6 +219,9 @@ static uint8_t  g_host_tx_buf[HOST_TX_QUEUE_DEPTH][HOST_TX_SLOT_BYTES];
 static uint16_t g_host_tx_len[HOST_TX_QUEUE_DEPTH];
 static volatile uint8_t g_host_tx_head;   /* superloop consumes (advances on drain) */
 static volatile uint8_t g_host_tx_tail;   /* callback produces (advances on queue) */
+/* Scratch buffer for atomic frame drain: copied from the ring slot before
+ * usb_tx streams it, so queue_host_tx can't overwrite mid-transfer. */
+static uint8_t  g_host_tx_scratch[HOST_TX_SLOT_BYTES];
 
 /* USB parser state */
 typedef enum {
@@ -1079,11 +1082,20 @@ int main( void )
              * — so the radio is never blocked waiting on USB handoff. Draining
              * one frame at a time interleaves USB I/O with radio-engine polls,
              * bounding the gap between engine runs to a single frame's TX time
-             * (~1ms for a 430-byte proposal) instead of the whole queue. */
+             * (~1ms for a 430-byte proposal) instead of the whole queue.
+             *
+             * CRITICAL: copy the frame to a local buffer before streaming.
+             * usb_tx takes ~77ms for an 877-byte frame. During that time,
+             * queue_host_tx (called from rac_post_callback inside
+             * smtc_rac_run_engine) can overwrite the head slot if the ring
+             * is full. Copying first prevents the producer from corrupting
+             * data being streamed to the host. */
             if( g_host_tx_head != g_host_tx_tail )
             {
-                ( void ) usb_tx( g_host_tx_buf[g_host_tx_head], g_host_tx_len[g_host_tx_head] );
+                uint16_t tx_len = g_host_tx_len[g_host_tx_head];
+                memcpy( g_host_tx_scratch, g_host_tx_buf[g_host_tx_head], tx_len );
                 g_host_tx_head = (uint8_t)( ( g_host_tx_head + 1 ) % HOST_TX_QUEUE_DEPTH );
+                ( void ) usb_tx( g_host_tx_scratch, tx_len );
             }
         }
 
