@@ -785,21 +785,14 @@ static void handle_config( const uint8_t* body )
     g_cfg.sync_word  = sys_get_le32( &body[10] );
     g_cfg.role       = body[14];
 
-    /* After CONFIG, restart RX with the new freq/sync for receiving roles.
-     * For TxOnly, abort the initial RX (started by init_radio on default freq)
-     * so the radio is in a clean state for TX. Done via flags — the actual
-     * abort happens in the main loop to avoid re-entrancy issues. */
-    if( g_cfg.role != FLRC_ROLE_TX_ONLY )
-    {
-        g_restart_rx_pending = true;
-    }
-    else
-    {
-        /* TxOnly: abort the initial RX so we're not listening on wrong freq.
-         * The main loop's TX trigger will handle TX submission. */
-        g_pending_tx_valid = false;
-        g_restart_rx_pending = false;
-    }
+    /* After CONFIG, restart RX with the new freq/sync for ALL roles.
+     * For TxOnly: the RAC needs an active RX transaction at all times so
+     * that request_burst_tx() can abort it before TX. Without an active
+     * transaction, smtc_rac_abort_radio_submit() has nothing to abort and
+     * the RAC hangs. The actual reception is handled by the dedicated RX
+     * radio on the second board — this RX is just to keep the RAC state
+     * machine valid for TX abort/submit cycles. */
+    g_restart_rx_pending = true;
 }
 
 static int usb_rx_poll( void )
@@ -987,10 +980,10 @@ int main( void )
 
         if( g_radio_ok )
         {
-            /* RX rearm — only for roles that receive (Both, RxOnly).
-             * TxOnly never enters RX mode. */
-            if( g_cfg.role != FLRC_ROLE_TX_ONLY &&
-                g_restart_rx_pending && g_burst_mode == BURST_RX )
+            /* RX rearm for ALL roles. Even TxOnly needs an active RX
+             * transaction in the RAC so request_burst_tx() can abort it.
+             * Without this, the RAC hangs after the first TX completes. */
+            if( g_restart_rx_pending && g_burst_mode == BURST_RX )
             {
                 g_restart_rx_pending = false;
                 start_burst_rx( );
