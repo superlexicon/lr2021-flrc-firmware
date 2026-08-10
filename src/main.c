@@ -86,11 +86,13 @@ static struct
     uint8_t  cr_host;
     int8_t   tx_pwr_dbm;
     uint32_t sync_word;
+    uint8_t  role;          /* FLRC_ROLE_BOTH / TX_ONLY / RX_ONLY */
 } g_cfg = {
     .freq_hz    = FLRC_DEFAULT_FREQ_HZ,
     .cr_host    = FLRC_DEFAULT_CODING_RATE,
     .tx_pwr_dbm = FLRC_DEFAULT_TX_PWR_DBM,
     .sync_word  = FLRC_DEFAULT_SYNC_WORD,
+    .role       = FLRC_ROLE_BOTH,
 };
 
 /* Burst mode state */
@@ -112,6 +114,12 @@ static uint32_t g_pending_tx_len = 0;
 static uint16_t g_pending_burst_id = 0;
 static bool     g_pending_tx_valid = false;
 static uint8_t  g_tx_repeat_count = 0;
+/* CSMA/CA backoff: the superloop won't request a TX until this time (ms) has
+ * passed. Set by the LBT busy handler to a random future time so nodes that
+ * deferred simultaneously don't collide again on retry. */
+static uint32_t g_tx_backoff_until_ms = 0;
+/* One-time flag: TxOnly radio needs to abort the initial RX once. */
+static bool     g_tx_only_rx_aborted = false;
 
 /* TX: On-air formatted burst buffer (array of 511-byte packets) */
 #define MAX_AIR_PACKETS ((FLRC_BURST_MAX_TOTAL_PAYLOAD + FLRC_MAX_PACKET_CHUNK_SIZE - 1) / FLRC_MAX_PACKET_CHUNK_SIZE)
@@ -121,15 +129,32 @@ static uint32_t g_tx_bytes_sent = 0;
 static uint16_t g_tx_fifo_len[2];
 static uint16_t g_tx_next_buf_idx = 0;
 
-/* RX: Out-of-order reassembly buffer */
+/* RX: Concurrent multi-burst reassembly.
+ *
+ * In a multi-node scenario, the RX radio sees interleaved packets from
+ * different senders (different burst_ids). A single reassembly buffer would
+ * wipe the in-progress burst every time a new burst_id arrives. Instead, we
+ * maintain a fixed pool of concurrent reassembly slots, each keyed by
+ * burst_id, so overlapping bursts are reassembled independently. */
 #define MAX_RX_PACKET_TRACK 128
-static uint8_t  g_rx_reassembly_buf[FLRC_BURST_MAX_TOTAL_PAYLOAD];
-static bool     g_rx_received_mask[MAX_RX_PACKET_TRACK];
-static uint16_t g_rx_received_count = 0;
-static uint16_t g_rx_total_packets = 0;
-static uint32_t g_rx_payload_len = 0;
-static uint32_t g_rx_payload_crc = 0;
-static uint16_t g_rx_current_burst_id = 0xFFFF;
+#define MAX_CONCURRENT_BURSTS 4
+#define BURST_REASM_PAYLOAD_MAX 2048   /* max payload per burst (consensus traffic) */
+#define BURST_SLOT_TIMEOUT_MS 5000     /* evict stale partial bursts after 5s */
+
+typedef struct {
+    bool     active;
+    uint16_t burst_id;
+    uint16_t total_packets;
+    uint32_t payload_len;
+    uint32_t payload_crc;
+    uint16_t received_count;
+    bool     received_mask[MAX_RX_PACKET_TRACK];
+    uint8_t  reassembly_buf[BURST_REASM_PAYLOAD_MAX];
+    int16_t  last_rssi;
+    uint32_t last_activity_ms;
+} burst_reasm_slot_t;
+
+static burst_reasm_slot_t g_rx_slots[MAX_CONCURRENT_BURSTS];
 static int16_t  g_rx_last_rssi = 0;
 
 /* Single packet RX buffer for RAC */
@@ -142,7 +167,37 @@ static struct {
     uint32_t packets_tx;
     uint32_t packets_rx;
     uint32_t crc_errors;
+    uint32_t host_tx_dropped;   /* deferred host-TX frames dropped (queue full / too big) */
 } g_stats = { 0 };
+
+/* ----------------------------------------------------------------------------
+ * Deferred host USB transfer queue.
+ *
+ * The radio callback (rac_post_callback) runs inside smtc_rac_run_engine(),
+ * which is polled in the main superloop. Doing the byte-polled USB CDC/UART
+ * transfer (usb_tx) synchronously in the callback blocks the radio engine for
+ * milliseconds per frame — the radio cannot re-arm RX (or start the next TX)
+ * until the host handoff completes, which is the dominant source of TX/RX
+ * turnaround latency on this half-duplex link.
+ *
+ * Instead, the callback copies the completed frame (header + payload + rssi,
+ * or a READY/ERROR/STATS control frame) into this ring and returns immediately,
+ * letting the radio state machine advance. The superloop drains the ring and
+ * performs the (slow) USB transfer after smtc_rac_run_engine(), when the radio
+ * is already settled. Single-threaded (callback + superloop both run in the
+ * main thread), so the ring needs no lock.
+ *
+ * Slot size covers realistic consensus traffic (block proposals ~430B, receipts,
+ * state diffs). The full 24KB burst is only used by the host benchmark scripts;
+ * oversized frames are dropped (counted in g_stats.host_tx_dropped) rather than
+ * blocking the radio.
+ * ------------------------------------------------------------------------- */
+#define HOST_TX_QUEUE_DEPTH 4
+#define HOST_TX_SLOT_BYTES  2048
+static uint8_t  g_host_tx_buf[HOST_TX_QUEUE_DEPTH][HOST_TX_SLOT_BYTES];
+static uint16_t g_host_tx_len[HOST_TX_QUEUE_DEPTH];
+static volatile uint8_t g_host_tx_head;   /* superloop consumes (advances on drain) */
+static volatile uint8_t g_host_tx_tail;   /* callback produces (advances on queue) */
 
 /* USB parser state */
 typedef enum {
@@ -182,21 +237,59 @@ static int usb_tx( const uint8_t* data, uint16_t len )
     return 0;
 }
 
+/*
+ * Stage a frame for deferred USB transfer to the host. Up to three segments
+ * (header / payload / trailer) are concatenated into one ring slot. Called
+ * from rac_post_callback — never blocks on USB. If the frame won't fit a slot
+ * or the ring is full, it is dropped and counted in g_stats.host_tx_dropped.
+ *
+ * The callback + superloop both run in the main thread (smtc_rac_run_engine
+ * is polled inline), so head/tail need no lock; `volatile` only keeps the
+ * compiler from caching them across k_yield().
+ */
+static void queue_host_tx( const uint8_t* seg1, uint16_t len1,
+                           const uint8_t* seg2, uint16_t len2,
+                           const uint8_t* seg3, uint16_t len3 )
+{
+    uint16_t total = (uint16_t)( len1 + len2 + len3 );
+    if( total > HOST_TX_SLOT_BYTES )
+    {
+        g_stats.host_tx_dropped++;
+        return;
+    }
+
+    uint8_t next = (uint8_t)( ( g_host_tx_tail + 1 ) % HOST_TX_QUEUE_DEPTH );
+    if( next == g_host_tx_head )
+    {
+        /* Ring full — drop the oldest queued frame so the newest (most
+         * time-relevant consensus data) is kept. */
+        g_host_tx_head = (uint8_t)( ( g_host_tx_head + 1 ) % HOST_TX_QUEUE_DEPTH );
+        g_stats.host_tx_dropped++;
+    }
+
+    uint8_t*  dst = g_host_tx_buf[g_host_tx_tail];
+    uint16_t  off = 0;
+    if( len1 ) { memcpy( dst + off, seg1, len1 ); off += len1; }
+    if( len2 ) { memcpy( dst + off, seg2, len2 ); off += len2; }
+    if( len3 ) { memcpy( dst + off, seg3, len3 ); off += len3; }
+    g_host_tx_len[g_host_tx_tail] = off;
+    g_host_tx_tail = next;
+}
+
 static void send_ready( void )
 {
     uint8_t pkt[3];
     pkt[0] = FLRC_MSG_READY;
     pkt[1] = ( uint8_t )( FLRC_BURST_PKT_PAYLOAD & 0xFF );
     pkt[2] = ( uint8_t )( ( FLRC_BURST_PKT_PAYLOAD >> 8 ) & 0xFF );
-    ( void ) usb_tx( pkt, sizeof( pkt ) );
+    queue_host_tx( pkt, sizeof( pkt ), NULL, 0, NULL, 0 );
 }
 
 static void send_error( uint8_t code, const char* msg )
 {
     uint8_t msg_len = msg ? ( uint8_t ) strlen( msg ) : 0;
     uint8_t header[3] = { FLRC_MSG_ERROR, code, msg_len };
-    ( void ) usb_tx( header, 3 );
-    if( msg_len > 0 ) ( void ) usb_tx( ( const uint8_t* ) msg, msg_len );
+    queue_host_tx( header, 3, ( const uint8_t* ) msg, msg_len, NULL, 0 );
 }
 
 
@@ -208,26 +301,24 @@ static void send_rx_packet( const uint8_t* payload, uint16_t len, int16_t rssi )
         ( uint8_t )( len & 0xFF ),
         ( uint8_t )( ( len >> 8 ) & 0xFF )
     };
-    ( void ) usb_tx( header, 3 );
-    if( len > 0 && payload ) ( void ) usb_tx( payload, len );
     uint8_t rssi_buf[2] = {
         ( uint8_t )( rssi & 0xFF ),
         ( uint8_t )( ( rssi >> 8 ) & 0xFF )
     };
-    ( void ) usb_tx( rssi_buf, 2 );
+    queue_host_tx( header, 3, payload, ( len > 0 ) ? len : 0, rssi_buf, 2 );
 }
 
 static void send_stats_packet( void )
 {
-    uint8_t header[3] = { FLRC_MSG_STATS, 20, 0 };
-    ( void ) usb_tx( header, 3 );
-    uint8_t stats_bytes[20];
+    uint8_t header[3] = { FLRC_MSG_STATS, 24, 0 };
+    uint8_t stats_bytes[24];
     sys_put_le32( g_stats.bursts_tx, &stats_bytes[0] );
     sys_put_le32( g_stats.bursts_rx, &stats_bytes[4] );
     sys_put_le32( g_stats.packets_tx, &stats_bytes[8] );
     sys_put_le32( g_stats.packets_rx, &stats_bytes[12] );
     sys_put_le32( g_stats.crc_errors, &stats_bytes[16] );
-    ( void ) usb_tx( stats_bytes, sizeof( stats_bytes ) );
+    sys_put_le32( g_stats.host_tx_dropped, &stats_bytes[20] );
+    queue_host_tx( header, 3, stats_bytes, sizeof( stats_bytes ), NULL, 0 );
 }
 
 static void send_time_packet( void )
@@ -394,6 +485,23 @@ static void execute_burst_tx( void )
     g_rac_ctx->scheduler_config.callback_post_radio_transaction = rac_post_callback;
     g_rac_ctx->scheduler_config.callback_pre_radio_transaction  = NULL;
 
+    /* Enable Listen-Before-Talk for roles that may contend with peer TXs
+     * (Both, TxOnly). RxOnly never transmits so LBT is irrelevant.
+     * In dual-radio mode (TxOnly), the dedicated RX radio on each peer is
+     * always listening, but TX-TX collisions between nodes' TX radios are
+     * still possible — LBT prevents those. */
+    if( g_cfg.role != FLRC_ROLE_RX_ONLY )
+    {
+        g_rac_ctx->lbt_context.lbt_enabled        = true;
+        g_rac_ctx->lbt_context.listen_duration_ms = 5;
+        g_rac_ctx->lbt_context.threshold_dbm      = -80;
+        g_rac_ctx->lbt_context.bandwidth_hz       = 1200000;
+    }
+    else
+    {
+        g_rac_ctx->lbt_context.lbt_enabled = false;
+    }
+
     g_burst_mode = BURST_TX;
     g_stats.bursts_tx++;
 
@@ -458,52 +566,108 @@ static void rac_post_callback( rp_status_t status )
             uint32_t total_payload_len = sys_le32_to_cpu( hdr.total_payload_len );
             uint32_t payload_crc32     = sys_le32_to_cpu( hdr.payload_crc32 );
 
-            if( magic == FLRC_BURST_HEADER_MAGIC && total_packets > 0 && total_packets <= MAX_RX_PACKET_TRACK && total_payload_len <= FLRC_BURST_MAX_TOTAL_PAYLOAD )
+            if( magic == FLRC_BURST_HEADER_MAGIC && total_packets > 0 && total_packets <= MAX_RX_PACKET_TRACK && total_payload_len <= BURST_REASM_PAYLOAD_MAX )
             {
-                /* Reset reassembly if new burst_id detected */
-                if( burst_id != g_rx_current_burst_id )
+                uint32_t now = smtc_modem_hal_get_time_in_ms( );
+
+                /* Find or allocate a reassembly slot for this burst_id. */
+                burst_reasm_slot_t* slot = NULL;
+                int free_idx = -1;
+                int oldest_idx = 0;
+                uint32_t oldest_time = UINT32_MAX;
+
+                for( int i = 0; i < MAX_CONCURRENT_BURSTS; i++ )
                 {
-                    g_rx_current_burst_id = burst_id;
-                    g_rx_total_packets    = total_packets;
-                    g_rx_payload_len      = total_payload_len;
-                    g_rx_payload_crc      = payload_crc32;
-                    g_rx_received_count   = 0;
-                    memset( g_rx_received_mask, 0, sizeof( g_rx_received_mask ) );
-                    memset( g_rx_reassembly_buf, 0, sizeof( g_rx_reassembly_buf ) );
-                    LOG_INF("Started receiving burst_id=%u, total_packets=%u, len=%u", burst_id, total_packets, total_payload_len);
+                    if( g_rx_slots[i].active && g_rx_slots[i].burst_id == burst_id )
+                    {
+                        slot = &g_rx_slots[i];
+                        break;
+                    }
+                    if( !g_rx_slots[i].active && free_idx < 0 )
+                    {
+                        free_idx = i;
+                    }
+                    /* Track oldest for eviction */
+                    if( g_rx_slots[i].active && g_rx_slots[i].last_activity_ms < oldest_time )
+                    {
+                        oldest_time = g_rx_slots[i].last_activity_ms;
+                        oldest_idx = i;
+                    }
                 }
 
-                if( packet_idx < total_packets && !g_rx_received_mask[packet_idx] )
+                /* Evict stale slots (timeout-based cleanup) */
+                for( int i = 0; i < MAX_CONCURRENT_BURSTS; i++ )
                 {
-                    g_rx_received_mask[packet_idx] = true;
-                    g_rx_received_count++;
+                    if( g_rx_slots[i].active &&
+                        ( now - g_rx_slots[i].last_activity_ms ) > BURST_SLOT_TIMEOUT_MS )
+                    {
+                        g_rx_slots[i].active = false;
+                        if( free_idx < 0 ) free_idx = i;
+                    }
+                }
+
+                if( slot == NULL )
+                {
+                    /* New burst_id — allocate a slot */
+                    if( free_idx < 0 )
+                    {
+                        /* All slots full — evict the oldest */
+                        free_idx = oldest_idx;
+                        g_rx_slots[free_idx].active = false;
+                    }
+                    slot = &g_rx_slots[free_idx];
+                    memset( slot, 0, sizeof( *slot ) );
+                    slot->active        = true;
+                    slot->burst_id      = burst_id;
+                    slot->total_packets = total_packets;
+                    slot->payload_len   = total_payload_len;
+                    slot->payload_crc   = payload_crc32;
+                    LOG_INF( "Started receiving burst_id=%u, pkts=%u, len=%u (slot %d)",
+                             burst_id, total_packets, total_payload_len, free_idx );
+                }
+
+                slot->last_activity_ms = now;
+                slot->last_rssi        = rssi;
+
+                if( packet_idx < total_packets && !slot->received_mask[packet_idx] )
+                {
+                    slot->received_mask[packet_idx] = true;
+                    slot->received_count++;
 
                     uint32_t offset = packet_idx * FLRC_MAX_PACKET_CHUNK_SIZE;
                     uint32_t chunk_len = ( total_payload_len - offset < FLRC_MAX_PACKET_CHUNK_SIZE ) ?
                                          ( total_payload_len - offset ) : FLRC_MAX_PACKET_CHUNK_SIZE;
 
-                    if( offset + chunk_len <= sizeof( g_rx_reassembly_buf ) )
+                    if( offset + chunk_len <= sizeof( slot->reassembly_buf ) )
                     {
-                        memcpy( &g_rx_reassembly_buf[offset], rx_buf + sizeof( flrc_packet_header_t ), chunk_len );
+                        memcpy( &slot->reassembly_buf[offset],
+                                rx_buf + sizeof( flrc_packet_header_t ), chunk_len );
                     }
 
-                    /* Check if ALL packets from 0 to total_packets - 1 are received */
-                    if( g_rx_received_count == g_rx_total_packets &&
-                        g_rx_received_mask[0] &&
-                        g_rx_received_mask[g_rx_total_packets - 1] )
+                    /* Check if ALL packets received */
+                    if( slot->received_count == slot->total_packets &&
+                        slot->received_mask[0] &&
+                        slot->received_mask[slot->total_packets - 1] )
                     {
-                        uint32_t calc_crc = flrc_burst_calc_crc32( g_rx_reassembly_buf, g_rx_payload_len );
-                        if( calc_crc == g_rx_payload_crc )
+                        uint32_t calc_crc = flrc_burst_calc_crc32(
+                            slot->reassembly_buf, slot->payload_len );
+                        if( calc_crc == slot->payload_crc )
                         {
                             g_stats.bursts_rx++;
-                            LOG_INF("Burst reassembly COMPLETE! Sending %u bytes to host", g_rx_payload_len);
-                            send_rx_packet( g_rx_reassembly_buf, ( uint16_t ) g_rx_payload_len, g_rx_last_rssi );
+                            LOG_INF( "Burst reassembly COMPLETE! burst_id=%u, %u bytes",
+                                     burst_id, slot->payload_len );
+                            send_rx_packet( slot->reassembly_buf,
+                                            ( uint16_t ) slot->payload_len,
+                                            slot->last_rssi );
                             smtc_rac_flrc_burst_rx_done( g_radio_access_id );
                         }
                         else
                         {
-                            LOG_WRN("CRC mismatch on reassembled burst: calc 0x%08x vs expected 0x%08x", calc_crc, g_rx_payload_crc);
+                            LOG_WRN( "CRC mismatch burst_id=%u: calc 0x%08x vs exp 0x%08x",
+                                     burst_id, calc_crc, slot->payload_crc );
                         }
+                        /* Free the slot regardless of CRC result */
+                        slot->active = false;
                     }
                 }
             }
@@ -523,6 +687,33 @@ static void rac_post_callback( rp_status_t status )
     case RP_STATUS_RX_CRC_ERROR:
         g_stats.crc_errors++;
         send_debug_event( 7, 0 ); /* Debug event 7: CRC error */
+        break;
+
+    case RP_STATUS_LBT_BUSY_CHANNEL:
+        /* CSMA/CA: LBT detected RF energy — another node is transmitting.
+         * Don't TX; apply a random backoff so nodes that deferred
+         * simultaneously don't collide again on retry. The backoff grows
+         * exponentially with consecutive deferrals (binary exponential
+         * backoff, capped at 64ms) to break persistent contention. */
+        g_tx_repeat_count++;
+        if( g_tx_repeat_count > 10 )
+        {
+            /* Channel persistently busy — drop this frame to avoid
+             * starving the radio with endless retries. */
+            g_pending_tx_valid = false;
+            g_pending_tx_len   = 0;
+            g_tx_repeat_count  = 0;
+        }
+        else
+        {
+            /* Random backoff: 1..(2^N) ms, capped at 64ms.
+             * g_tx_repeat_count starts at 1 after the first deferral. */
+            uint32_t max_backoff = 1U << ( g_tx_repeat_count > 6 ? 6 : g_tx_repeat_count );
+            uint32_t backoff_ms  = 1 + ( smtc_modem_hal_get_time_in_ms( ) % max_backoff );
+            g_tx_backoff_until_ms = smtc_modem_hal_get_time_in_ms( ) + backoff_ms;
+        }
+        g_burst_mode         = BURST_RX;
+        g_restart_rx_pending = true;
         break;
 
     case RP_STATUS_RADIO_UNLOCKED:
@@ -578,6 +769,23 @@ static void handle_config( const uint8_t* body )
     g_cfg.cr_host    = body[8];
     g_cfg.tx_pwr_dbm = ( int8_t ) body[9];
     g_cfg.sync_word  = sys_get_le32( &body[10] );
+    g_cfg.role       = body[14];
+
+    /* After CONFIG, restart RX with the new freq/sync for receiving roles.
+     * For TxOnly, abort the initial RX (started by init_radio on default freq)
+     * so the radio is in a clean state for TX. Done via flags — the actual
+     * abort happens in the main loop to avoid re-entrancy issues. */
+    if( g_cfg.role != FLRC_ROLE_TX_ONLY )
+    {
+        g_restart_rx_pending = true;
+    }
+    else
+    {
+        /* TxOnly: abort the initial RX so we're not listening on wrong freq.
+         * The main loop's TX trigger will handle TX submission. */
+        g_pending_tx_valid = false;
+        g_restart_rx_pending = false;
+    }
 }
 
 static int usb_rx_poll( void )
@@ -732,7 +940,12 @@ static int init_radio( void )
 
     g_rac_ctx->scheduler_config.callback_post_radio_transaction = rac_post_callback;
 
-    start_burst_rx( );
+    /* In TxOnly mode, don't start RX — the radio is purely a transmitter.
+     * In Both and RxOnly modes, start continuous burst RX. */
+    if( g_cfg.role != FLRC_ROLE_TX_ONLY )
+    {
+        start_burst_rx( );
+    }
     return 0;
 }
 
@@ -760,19 +973,40 @@ int main( void )
 
         if( g_radio_ok )
         {
-            if( g_restart_rx_pending && g_burst_mode == BURST_RX )
+            /* RX rearm — only for roles that receive (Both, RxOnly).
+             * TxOnly never enters RX mode. */
+            if( g_cfg.role != FLRC_ROLE_TX_ONLY &&
+                g_restart_rx_pending && g_burst_mode == BURST_RX )
             {
                 g_restart_rx_pending = false;
                 start_burst_rx( );
             }
 
-            /* Immediate TX trigger once host payload buffering completes */
-            if( g_pending_tx_valid && g_burst_mode == BURST_RX )
+            /* TX trigger — only for roles that transmit (Both, TxOnly).
+             * RxOnly never transmits.
+             * For TxOnly: the initial RX (on default freq) is automatically
+             * aborted by request_burst_tx() when the first TX is queued. */
+            if( g_cfg.role != FLRC_ROLE_RX_ONLY &&
+                g_pending_tx_valid && g_burst_mode == BURST_RX &&
+                smtc_modem_hal_get_time_in_ms( ) >= g_tx_backoff_until_ms )
             {
                 request_burst_tx( );
             }
 
             ( void ) smtc_rac_run_engine( );
+
+            /* Drain ONE deferred host-TX frame per loop iteration, AFTER the
+             * radio engine has run. This performs the (slow) byte-polled USB
+             * transfer here in the superloop — never inside rac_post_callback
+             * — so the radio is never blocked waiting on USB handoff. Draining
+             * one frame at a time interleaves USB I/O with radio-engine polls,
+             * bounding the gap between engine runs to a single frame's TX time
+             * (~1ms for a 430-byte proposal) instead of the whole queue. */
+            if( g_host_tx_head != g_host_tx_tail )
+            {
+                ( void ) usb_tx( g_host_tx_buf[g_host_tx_head], g_host_tx_len[g_host_tx_head] );
+                g_host_tx_head = (uint8_t)( ( g_host_tx_head + 1 ) % HOST_TX_QUEUE_DEPTH );
+            }
         }
 
         k_yield( );

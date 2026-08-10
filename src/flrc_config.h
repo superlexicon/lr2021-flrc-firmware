@@ -37,7 +37,12 @@
 #define FLRC_ERR_PAYLOAD_TOO_BIG  0x02
 #define FLRC_ERR_BAD_CONFIG       0x03
 
-#define FLRC_CONFIG_BODY_LEN      14
+#define FLRC_CONFIG_BODY_LEN      15  /* freq(4)+bw(4)+cr(1)+txpwr(1)+sync(4)+role(1) */
+
+/* Radio role (byte 14 of CONFIG body) */
+#define FLRC_ROLE_BOTH      0   /* TX + RX — single-radio mode (default) */
+#define FLRC_ROLE_TX_ONLY   1   /* TX only — skips reader task / RX */
+#define FLRC_ROLE_RX_ONLY   2   /* RX only — skips discovery TX / outbound TX */
 
 /* On-air packet header (16 bytes) */
 typedef struct __attribute__((packed)) {
