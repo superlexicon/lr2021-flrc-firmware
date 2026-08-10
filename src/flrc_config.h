@@ -11,11 +11,12 @@
 
 #include <stdint.h>
 
-/* Default Radio Settings */
-#define FLRC_DEFAULT_FREQ_HZ       867100000U  /* 867.1 MHz Sub-GHz RF path */
-#define FLRC_DEFAULT_CODING_RATE   1           /* CR_3_4 */
-#define FLRC_DEFAULT_TX_PWR_DBM    0           /* 0 dBm output power (prevents desktop LNA saturation) */
-#define FLRC_DEFAULT_SYNC_WORD     0x12345690U /* Default sync word */
+/* Default Radio Settings — must match the host's config.json so the radio
+ * is on the correct frequency/sync BEFORE the CONFIG command arrives. */
+#define FLRC_DEFAULT_FREQ_HZ       915000000U  /* 915 MHz US915 Sub-GHz */
+#define FLRC_DEFAULT_CODING_RATE   2           /* CR_3_4 (host coding_rate=2) */
+#define FLRC_DEFAULT_TX_PWR_DBM    20          /* 20 dBm */
+#define FLRC_DEFAULT_SYNC_WORD     0x534C2021U /* matches host sync 0x534C2021 */
 
 /* Maximum application payload and on-air packet sizing */
 #define FLRC_BURST_MAX_TOTAL_PAYLOAD 24576
