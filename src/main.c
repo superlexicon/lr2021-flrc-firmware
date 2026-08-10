@@ -364,8 +364,8 @@ static void start_burst_rx( void )
     p->crc_seed                  = 0xFFFFFFFF;
     p->crc_polynomial            = 0x755B;
     p->max_rx_size               = FLRC_BURST_PKT_PAYLOAD;
-    p->burst_rx_size             = FLRC_BURST_MAX_TOTAL_PAYLOAD;
-    p->rx_burst_timeout_margin_ms = 60000; /* 60-second RX window margin */
+    p->burst_rx_size             = FLRC_BURST_MAX_TOTAL_PAYLOAD; /* 24576 — RAC needs full range for continuous RX */
+    p->rx_burst_timeout_margin_ms = 60000; /* 60s — keeps RAC in continuous RX */
     p->min_interframe_delay_us = 300;
 
     g_rac_ctx->smtc_rac_data_buffer_setup.rx_payload_buffer = g_rac_rx_pkt_buf;
@@ -712,15 +712,15 @@ static void rac_post_callback( rp_status_t status )
             uint32_t backoff_ms  = 1 + ( smtc_modem_hal_get_time_in_ms( ) % max_backoff );
             g_tx_backoff_until_ms = smtc_modem_hal_get_time_in_ms( ) + backoff_ms;
         }
-        /* For TxOnly: stay in BURST_RX so the TX trigger can retry after
-         * backoff. Don't set g_restart_rx_pending (the main loop skips RX
-         * restart for TxOnly anyway, and setting it is misleading).
-         * For Both/RxOnly: restart RX to keep listening. */
+        /* LBT detected busy channel: don't restart RX immediately.
+         * Set g_burst_mode = BURST_RX so the TX trigger can retry after
+         * backoff. Setting g_restart_rx_pending causes an infinite loop:
+         * start_burst_rx() → TX trigger → abort → LBT → busy → restart...
+         * The main loop's g_restart_rx_pending check also requires
+         * g_burst_mode == BURST_RX, so setting burst_mode alone is enough
+         * to allow TX retry without the RX restart loop. */
         g_burst_mode = BURST_RX;
-        if( g_cfg.role != FLRC_ROLE_TX_ONLY )
-        {
-            g_restart_rx_pending = true;
-        }
+        /* Do NOT set g_restart_rx_pending — it causes a tight loop. */
         break;
 
     case RP_STATUS_RADIO_UNLOCKED:
