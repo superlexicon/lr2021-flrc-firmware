@@ -32,6 +32,7 @@
 #define FLRC_MSG_STATS      'S'
 #define FLRC_MSG_TIME       'M'
 #define FLRC_MSG_ERROR      'E'
+#define FLRC_MSG_RESET      'X'  /* Host-requested system reboot */
 
 /* Error codes */
 #define FLRC_ERR_RADIO_INIT       0x01

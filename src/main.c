@@ -861,6 +861,18 @@ static int usb_rx_poll( void )
                  * via the deferred queue (non-blocking). */
                 send_stats_packet( );
             }
+            else if( tag == FLRC_MSG_RESET )
+            {
+                /* Host requests a system reboot. Send an ACK directly
+                 * (not via the deferred queue, which would be lost on
+                 * reboot), then cold-reset the MCU. This recovers from
+                 * a stuck RAC / corrupted radio state. */
+                LOG_INF( "Reset requested by host — rebooting" );
+                uint8_t ack = FLRC_MSG_READY;
+                usb_tx( &ack, 1 );
+                k_busy_wait( 10000 ); /* 10ms for USB flush */
+                NVIC_SystemReset( );
+            }
             break;
 
         case RX_STATE_TX_MAGIC:
