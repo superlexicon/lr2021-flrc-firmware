@@ -142,9 +142,10 @@ static bool     g_tx_only_rx_aborted = false;
 #define STATS_EMIT_INTERVAL_MS  10000
 static uint32_t g_last_stats_emit_ms = 0;
 
-/* TX: On-air formatted burst buffer (array of 511-byte packets) */
+/* TX: On-air formatted burst buffer — heap-allocated to save 35KB static BSS.
+ * Allocated in execute_burst_tx(), freed in RP_STATUS_RADIO_UNLOCKED. */
 #define MAX_AIR_PACKETS ((FLRC_BURST_MAX_TOTAL_PAYLOAD + FLRC_MAX_PACKET_CHUNK_SIZE - 1) / FLRC_MAX_PACKET_CHUNK_SIZE)
-static uint8_t  g_tx_air_packets[MAX_AIR_PACKETS][FLRC_BURST_PKT_PAYLOAD];
+static uint8_t (*g_tx_air_packets)[FLRC_BURST_PKT_PAYLOAD] = NULL;  /* heap: k_malloc'd per TX */
 static uint32_t g_tx_air_total_len = 0;
 static uint32_t g_tx_bytes_sent = 0;
 static uint16_t g_tx_fifo_len[2];
@@ -158,8 +159,8 @@ static uint16_t g_tx_next_buf_idx = 0;
  * maintain a fixed pool of concurrent reassembly slots, each keyed by
  * burst_id, so overlapping bursts are reassembled independently. */
 #define MAX_RX_PACKET_TRACK 128
-#define MAX_CONCURRENT_BURSTS 4
-#define BURST_REASM_PAYLOAD_MAX 12288  /* max payload per burst (consensus + bytecode txns) */
+#define MAX_CONCURRENT_BURSTS 1
+#define BURST_REASM_PAYLOAD_MAX 49152  /* max payload per burst — 48KB (heap-allocated) */
 #define BURST_SLOT_TIMEOUT_MS 5000     /* evict stale partial bursts after 5s */
 
 typedef struct {
@@ -170,7 +171,7 @@ typedef struct {
     uint32_t payload_crc;
     uint16_t received_count;
     bool     received_mask[MAX_RX_PACKET_TRACK];
-    uint8_t  reassembly_buf[BURST_REASM_PAYLOAD_MAX];
+    uint8_t* reassembly_buf;  /* heap-allocated: k_malloc'd when slot activated */
     int16_t  last_rssi;
     uint32_t last_activity_ms;
 } burst_reasm_slot_t;
@@ -442,6 +443,21 @@ static void execute_burst_tx( void )
     uint32_t payload_crc = flrc_burst_calc_crc32( g_pending_tx_buf, payload_len );
     uint16_t total_packets = ( payload_len + FLRC_MAX_PACKET_CHUNK_SIZE - 1 ) / FLRC_MAX_PACKET_CHUNK_SIZE;
 
+    /* Heap-allocate the air packet array (freed on RADIO_UNLOCKED).
+     * Size: total_packets * FLRC_BURST_PKT_PAYLOAD bytes. */
+    size_t air_buf_size = (size_t)total_packets * FLRC_BURST_PKT_PAYLOAD;
+    if( g_tx_air_packets == NULL )
+    {
+        g_tx_air_packets = k_malloc( air_buf_size );
+        if( g_tx_air_packets == NULL )
+        {
+            LOG_ERR( "TX: k_malloc(%u) for air packets failed — dropping frame", (unsigned)air_buf_size );
+            g_pending_tx_valid = false;
+            g_restart_rx_pending = true;
+            return;
+        }
+    }
+
     g_tx_air_total_len = total_packets * FLRC_BURST_PKT_PAYLOAD;
 
     for( uint16_t i = 0; i < total_packets; i++ )
@@ -633,6 +649,11 @@ static void rac_post_callback( rp_status_t status )
                     if( g_rx_slots[i].active &&
                         ( now - g_rx_slots[i].last_activity_ms ) > BURST_SLOT_TIMEOUT_MS )
                     {
+                        if( g_rx_slots[i].reassembly_buf != NULL )
+                        {
+                            k_free( g_rx_slots[i].reassembly_buf );
+                            g_rx_slots[i].reassembly_buf = NULL;
+                        }
                         g_rx_slots[i].active = false;
                         if( free_idx < 0 ) free_idx = i;
                     }
@@ -645,6 +666,11 @@ static void rac_post_callback( rp_status_t status )
                     {
                         /* All slots full — evict the oldest */
                         free_idx = oldest_idx;
+                        if( g_rx_slots[free_idx].reassembly_buf != NULL )
+                        {
+                            k_free( g_rx_slots[free_idx].reassembly_buf );
+                            g_rx_slots[free_idx].reassembly_buf = NULL;
+                        }
                         g_rx_slots[free_idx].active = false;
                     }
                     slot = &g_rx_slots[free_idx];
@@ -654,6 +680,14 @@ static void rac_post_callback( rp_status_t status )
                     slot->total_packets = total_packets;
                     slot->payload_len   = total_payload_len;
                     slot->payload_crc   = payload_crc32;
+                    /* Heap-allocate reassembly buffer for this burst */
+                    slot->reassembly_buf = k_malloc( BURST_REASM_PAYLOAD_MAX );
+                    if( slot->reassembly_buf == NULL )
+                    {
+                        LOG_ERR( "RX: k_malloc(%u) for reassembly failed — dropping burst", BURST_REASM_PAYLOAD_MAX );
+                        slot->active = false;
+                        break;
+                    }
                     LOG_INF( "Started receiving burst_id=%u, pkts=%u, len=%u (slot %d)",
                              burst_id, total_packets, total_payload_len, free_idx );
                 }
@@ -699,6 +733,11 @@ static void rac_post_callback( rp_status_t status )
                                      burst_id, calc_crc, slot->payload_crc );
                         }
                         /* Free the slot regardless of CRC result */
+                        if( slot->reassembly_buf != NULL )
+                        {
+                            k_free( slot->reassembly_buf );
+                            slot->reassembly_buf = NULL;
+                        }
                         slot->active = false;
                     }
                 }
@@ -732,6 +771,11 @@ static void rac_post_callback( rp_status_t status )
         {
             /* Channel persistently busy — drop this frame to avoid
              * starving the radio with endless retries. */
+            if( g_tx_air_packets != NULL )
+            {
+                k_free( g_tx_air_packets );
+                g_tx_air_packets = NULL;
+            }
             g_pending_tx_valid = false;
             g_pending_tx_len   = 0;
             g_tx_repeat_count  = 0;
@@ -765,6 +809,12 @@ static void rac_post_callback( rp_status_t status )
         {
             LOG_INF( "TX burst complete" );
             send_debug_event( 8, 0 ); /* Debug event 8: TX complete */
+            /* Free heap-allocated air packets */
+            if( g_tx_air_packets != NULL )
+            {
+                k_free( g_tx_air_packets );
+                g_tx_air_packets = NULL;
+            }
             send_ready( );
             g_pending_tx_valid   = false;
             g_pending_tx_len     = 0;
