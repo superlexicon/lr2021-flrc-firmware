@@ -19,7 +19,7 @@
 #define FLRC_DEFAULT_SYNC_WORD     0x534C2021U /* matches host sync 0x534C2021 */
 
 /* Maximum application payload and on-air packet sizing */
-#define FLRC_BURST_MAX_TOTAL_PAYLOAD 32768
+#define FLRC_BURST_MAX_TOTAL_PAYLOAD 24576
 #define FLRC_BURST_PKT_PAYLOAD       252
 #define FLRC_BURST_HEADER_MAGIC      0x4642 /* 'FB' */
 
