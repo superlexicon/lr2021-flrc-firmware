@@ -158,8 +158,8 @@ static uint16_t g_tx_next_buf_idx = 0;
  * maintain a fixed pool of concurrent reassembly slots, each keyed by
  * burst_id, so overlapping bursts are reassembled independently. */
 #define MAX_RX_PACKET_TRACK 128
-#define MAX_CONCURRENT_BURSTS 2
-#define BURST_REASM_PAYLOAD_MAX 24576  /* 24KB per slot × 2 slots = 48KB total */
+#define MAX_CONCURRENT_BURSTS 4
+#define BURST_REASM_PAYLOAD_MAX 12288  /* max payload per burst (consensus + bytecode txns) */
 #define BURST_SLOT_TIMEOUT_MS 5000     /* evict stale partial bursts after 5s */
 
 typedef struct {
