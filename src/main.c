@@ -241,9 +241,66 @@ static uint16_t             have      = 0;
 static uint8_t              config_body[FLRC_CONFIG_BODY_LEN];
 static uint8_t              window_body[8];
 
+/* ----------------------------------------------------------------------- *
+ * Interrupt-driven UART RX ring buffer (hw_modem pattern).
+ *
+ * Poll-mode RX on the nRF UARTE has ~6 bytes of buffering (5-entry HW FIFO
+ * + 1-byte poll DMA ≈ 65µs of line time at 921600 baud). Any main-loop
+ * window longer than that — radio IRQ processing 0.5-1.5ms, a host-TX
+ * drain 5-24ms — silently dropped bytes during host writes, capping
+ * reliable frames at ~1KB. The UART ISR now drains the FIFO into this
+ * ring regardless of main-loop state; usb_rx_poll() consumes it. The
+ * hw_modem reference sample (samples/usp/rac/hw_modem) uses this exact
+ * uart_irq_* contract on the same driver stack.
+ *
+ * Single producer (ISR) / single consumer (main loop): volatile head/tail
+ * with power-of-2 masking needs no lock. usb_rx_poll() must be the ONLY
+ * consumer, and the ISR the ONLY place calling uart_fifo_read — mixing
+ * uart_poll_in with the IRQ path would contend for the driver's 1-byte
+ * DMA buffer.
+ * ----------------------------------------------------------------------- */
+#define UART_RX_RING_SIZE 8192  /* power of 2 */
+static uint8_t  g_rx_ring[UART_RX_RING_SIZE];
+static volatile uint16_t g_rx_ring_head = 0; /* ISR writes */
+static volatile uint16_t g_rx_ring_tail = 0; /* main loop reads */
+static volatile uint32_t g_rx_ring_dropped = 0;
+
+static void uart_rx_isr( const struct device* dev, void* user_data )
+{
+    ARG_UNUSED( user_data );
+
+    if( !uart_irq_update( dev ) )
+    {
+        return;
+    }
+
+    while( uart_irq_rx_ready( dev ) )
+    {
+        uint8_t b;
+        int n = uart_fifo_read( dev, &b, 1 );
+        if( n <= 0 )
+        {
+            break;
+        }
+        uint16_t next = ( g_rx_ring_head + 1 ) & ( UART_RX_RING_SIZE - 1 );
+        if( next == g_rx_ring_tail )
+        {
+            /* Ring full — drop rather than overwrite in-flight data. */
+            g_rx_ring_dropped++;
+            break;
+        }
+        g_rx_ring[g_rx_ring_head] = b;
+        g_rx_ring_head = next;
+    }
+}
+
 static int usb_init( void )
 {
     if( !device_is_ready( cdc_dev ) ) return -ENODEV;
+
+    uart_irq_callback_user_data_set( cdc_dev, uart_rx_isr, NULL );
+    uart_irq_rx_enable( cdc_dev );
+
     return 0;
 }
 
@@ -335,8 +392,8 @@ static void send_rx_packet( const uint8_t* payload, uint16_t len, int16_t rssi )
 static void send_stats_packet( void )
 {
     /* Extended stats: 24 bytes original + 16 bytes diagnostic = 40 bytes */
-    uint8_t header[3] = { FLRC_MSG_STATS, 40, 0 };
-    uint8_t stats_bytes[40];
+    uint8_t header[3] = { FLRC_MSG_STATS, 44, 0 };
+    uint8_t stats_bytes[44];
     sys_put_le32( g_stats.bursts_tx, &stats_bytes[0] );
     sys_put_le32( g_stats.bursts_rx, &stats_bytes[4] );
     sys_put_le32( g_stats.packets_tx, &stats_bytes[8] );
@@ -350,7 +407,7 @@ static void send_stats_packet( void )
     stats_bytes[27] = g_restart_rx_pending ? 1 : 0;      /* RX restart needed? */
     sys_put_le32( smtc_modem_hal_get_time_in_ms( ) - g_tx_backoff_until_ms, &stats_bytes[28] ); /* ms until backoff clears (negative if past) */
     sys_put_le32( smtc_modem_hal_get_time_in_ms( ), &stats_bytes[32] );  /* current MCU time */
-    sys_put_le32( g_stats.packets_rx, &stats_bytes[36] ); /* placeholder for future use */
+    sys_put_le32( g_rx_ring_dropped, &stats_bytes[36] ); /* UART RX ring drops (must stay 0) */
     queue_host_tx( header, 3, stats_bytes, sizeof( stats_bytes ), NULL, 0 );
 }
 
@@ -833,8 +890,10 @@ static int usb_rx_poll( void )
     }
 
     uint8_t b;
-    while( uart_poll_in( cdc_dev, &b ) == 0 )
+    while( g_rx_ring_tail != g_rx_ring_head )
     {
+        b = g_rx_ring[g_rx_ring_tail];
+        g_rx_ring_tail = ( g_rx_ring_tail + 1 ) & ( UART_RX_RING_SIZE - 1 );
         last_rx_time = k_uptime_get_32();
         switch( state )
         {
