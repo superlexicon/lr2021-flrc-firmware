@@ -20,7 +20,7 @@
 
 /* Maximum application payload and on-air packet sizing */
 #define FLRC_BURST_MAX_TOTAL_PAYLOAD 24576
-#define FLRC_BURST_PKT_PAYLOAD       511
+#define FLRC_BURST_PKT_PAYLOAD       252
 #define FLRC_BURST_HEADER_MAGIC      0x4642 /* 'FB' */
 
 /* Host Protocol Messages */
