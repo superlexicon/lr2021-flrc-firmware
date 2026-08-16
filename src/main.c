@@ -115,9 +115,22 @@ static volatile uint32_t g_tx_start_time_ms = 0;
 static uint32_t g_slot_offset_ms = 100;   /* Default slot offset within epoch */
 static uint32_t g_slot_period_ms = 1000;  /* Default slot period (1 second) */
 
-/* TX: Application pending buffer */
+/* TX: Application pending buffer — the buffer the radio machinery reads
+ * (execute_burst_tx copies it into the air-packet staging; the RAC
+ * callbacks clear its valid flag on completion/drop). Never written by
+ * the parser while a burst may be executing. */
 static uint8_t  g_pending_tx_buf[FLRC_BURST_MAX_TOTAL_PAYLOAD];
 static uint32_t g_pending_tx_len = 0;
+
+/* TX: staging slot — the parser writes here. The superloop promotes a
+ * completed staging frame into the pending buffer when the radio is free,
+ * giving a 2-deep queue (one airing, one queued). The host's windowed
+ * pipeline (max 2 frames outstanding) matches this depth; a frame that
+ * completes while staging is still occupied overwrites it (counted). */
+static uint8_t  g_staging_tx_buf[FLRC_BURST_MAX_TOTAL_PAYLOAD];
+static uint32_t g_staging_tx_len = 0;
+static bool     g_staging_tx_valid = false;
+static uint32_t g_staging_overwrites = 0;
 /* burst_id must be globally unique across all nodes so the multi-slot
  * reassembly doesn't mix packets from different senders into the same slot.
  * We offset each node's burst_id range by a per-node value derived from the
@@ -158,7 +171,9 @@ static uint16_t g_tx_next_buf_idx = 0;
  * maintain a fixed pool of concurrent reassembly slots, each keyed by
  * burst_id, so overlapping bursts are reassembled independently. */
 #define MAX_RX_PACKET_TRACK 128
-#define MAX_CONCURRENT_BURSTS 4
+/* 3 concurrent reassembly slots: the network has 3 nodes, so at most 3
+ * peers can be transmitting at once; a 4th slot was pure RAM. */
+#define MAX_CONCURRENT_BURSTS 3
 #define BURST_REASM_PAYLOAD_MAX 12288  /* max payload per burst (consensus + bytecode txns) */
 #define BURST_SLOT_TIMEOUT_MS 5000     /* evict stale partial bursts after 5s */
 
@@ -213,8 +228,12 @@ static struct {
  * oversized frames are dropped (counted in g_stats.host_tx_dropped) rather than
  * blocking the radio.
  * ------------------------------------------------------------------------- */
-#define HOST_TX_QUEUE_DEPTH 4
-#define HOST_TX_SLOT_BYTES  2048
+/* Hostbound (MCU→host) frame ring: 3 slots, each sized to carry a FULL
+ * reassembled 12,288B RX frame (3B 'R' header + payload + 2B RSSI +
+ * margin). The old 2048B slots silently dropped every large burst before
+ * it reached the host — capping the whole network at ~2KB frames. */
+#define HOST_TX_QUEUE_DEPTH 3
+#define HOST_TX_SLOT_BYTES  12400
 static uint8_t  g_host_tx_buf[HOST_TX_QUEUE_DEPTH][HOST_TX_SLOT_BYTES];
 static uint16_t g_host_tx_len[HOST_TX_QUEUE_DEPTH];
 static volatile uint8_t g_host_tx_head;   /* superloop consumes (advances on drain) */
@@ -392,8 +411,8 @@ static void send_rx_packet( const uint8_t* payload, uint16_t len, int16_t rssi )
 static void send_stats_packet( void )
 {
     /* Extended stats: 24 bytes original + 16 bytes diagnostic = 40 bytes */
-    uint8_t header[3] = { FLRC_MSG_STATS, 44, 0 };
-    uint8_t stats_bytes[44];
+    uint8_t header[3] = { FLRC_MSG_STATS, 48, 0 };
+    uint8_t stats_bytes[48];
     sys_put_le32( g_stats.bursts_tx, &stats_bytes[0] );
     sys_put_le32( g_stats.bursts_rx, &stats_bytes[4] );
     sys_put_le32( g_stats.packets_tx, &stats_bytes[8] );
@@ -408,6 +427,7 @@ static void send_stats_packet( void )
     sys_put_le32( smtc_modem_hal_get_time_in_ms( ) - g_tx_backoff_until_ms, &stats_bytes[28] ); /* ms until backoff clears (negative if past) */
     sys_put_le32( smtc_modem_hal_get_time_in_ms( ), &stats_bytes[32] );  /* current MCU time */
     sys_put_le32( g_rx_ring_dropped, &stats_bytes[36] ); /* UART RX ring drops (must stay 0) */
+    sys_put_le32( g_staging_overwrites, &stats_bytes[40] ); /* TX queue overruns (must stay 0) */
     queue_host_tx( header, 3, stats_bytes, sizeof( stats_bytes ), NULL, 0 );
 }
 
@@ -989,10 +1009,14 @@ static int usb_rx_poll( void )
             break;
 
         case RX_STATE_PAYLOAD:
-            g_pending_tx_buf[have++] = b;
+            g_staging_tx_buf[have++] = b;
             if( have >= frame_len )
             {
-                g_pending_tx_len = frame_len;
+                if( g_staging_tx_valid )
+                {
+                    g_staging_overwrites++; /* host overran the 2-deep queue */
+                }
+                g_staging_tx_len = frame_len;
                 g_pending_burst_id++;
                 /* Apply per-node random offset so different nodes don't
                  * collide on the same burst_id. Without this, two nodes
@@ -1000,8 +1024,8 @@ static int usb_rx_poll( void )
                  * the receiver's multi-slot reassembly mixes their packets
                  * into the same slot → CRC failure on both. */
                 /* (actual offset applied at TX header build time) */
-                g_pending_tx_valid = true;
-                send_debug_event( 20, g_pending_tx_len ); /* Debug event 20: Payload enqueued */
+                g_staging_tx_valid = true;
+                send_debug_event( 20, g_staging_tx_len ); /* Debug event 20: Payload enqueued */
                 LOG_INF( "Host payload buffered: %u bytes, burst_id=%u", g_pending_tx_len, g_pending_burst_id );
                 state = RX_STATE_TAG;
             }
@@ -1101,6 +1125,19 @@ int main( void )
             {
                 g_restart_rx_pending = false;
                 start_burst_rx( );
+            }
+
+            /* TX queue promotion: move a completed staging frame into the
+             * pending (air) buffer when the radio isn't holding one. This
+             * is what lets the host pipeline: it may stream frame N+1 over
+             * UART while frame N is still airing. */
+            if( !g_pending_tx_valid && g_staging_tx_valid )
+            {
+                memcpy( g_pending_tx_buf, g_staging_tx_buf, g_staging_tx_len );
+                g_pending_tx_len   = g_staging_tx_len;
+                g_pending_tx_valid = true;
+                g_staging_tx_valid = false;
+                g_staging_tx_len   = 0;
             }
 
             /* TX trigger — only for roles that transmit (Both, TxOnly).

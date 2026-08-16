@@ -18,8 +18,11 @@
 #define FLRC_DEFAULT_TX_PWR_DBM    20          /* 20 dBm */
 #define FLRC_DEFAULT_SYNC_WORD     0x534C2021U /* matches host sync 0x534C2021 */
 
-/* Maximum application payload and on-air packet sizing */
-#define FLRC_BURST_MAX_TOTAL_PAYLOAD 24576
+/* Maximum application payload and on-air packet sizing.
+ * Capped at the RX reassembly size (BURST_REASM_PAYLOAD_MAX): the largest
+ * frame any peer can accept is 12,288B, so a bigger TX payload only wasted
+ * RAM (g_pending/queue buffer + air-packet staging). */
+#define FLRC_BURST_MAX_TOTAL_PAYLOAD 12288
 #define FLRC_BURST_PKT_PAYLOAD       252
 #define FLRC_BURST_HEADER_MAGIC      0x4642 /* 'FB' */
 
