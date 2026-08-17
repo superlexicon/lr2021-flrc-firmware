@@ -808,10 +808,17 @@ static void rac_post_callback( rp_status_t status )
         if( g_tx_repeat_count > 10 )
         {
             /* Channel persistently busy — drop this frame to avoid
-             * starving the radio with endless retries. */
+             * starving the radio with endless retries. RESTART RX: the
+             * RX transaction was aborted to seize the radio for this TX,
+             * and with the frame now dropped nothing else will ever set
+             * g_restart_rx_pending — the radio stayed DEAF until some
+             * later TX happened to succeed (observed: 30s of near-zero
+             * btx/brx under phase-aligned peer traffic). Safe here: no
+             * TX is pending, so the superloop cannot re-abort in a loop. */
             g_pending_tx_valid = false;
             g_pending_tx_len   = 0;
             g_tx_repeat_count  = 0;
+            g_restart_rx_pending = true;
         }
         else
         {
@@ -837,6 +844,15 @@ static void rac_post_callback( rp_status_t status )
         {
             send_debug_event( 9, 0 ); /* Debug event 9: RX aborted for TX */
             execute_burst_tx( );
+        }
+        else if( g_burst_mode == BURST_TX_ABORTING )
+        {
+            /* Abort completed but the frame is gone (dropped/watchdog):
+             * without this fallback the mode stays BURST_TX_ABORTING
+             * forever — the TX trigger and the RX restart both require
+             * BURST_RX, wedging TX and RX permanently. */
+            g_burst_mode         = BURST_RX;
+            g_restart_rx_pending = true;
         }
         else if( g_burst_mode == BURST_TX )
         {
