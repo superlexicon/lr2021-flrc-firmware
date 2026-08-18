@@ -30,6 +30,7 @@
 #include "flrc_burst_protocol.h"
 
 #include "smtc_rac.h"
+#include <lr20xx_radio_flrc.h>
 #include "smtc_rac_api.h"
 #include "smtc_sw_platform_helper.h"
 #include "smtc_modem_hal.h"
@@ -64,9 +65,36 @@ static int  usb_rx_poll( void );
 static void send_ready( void );
 static void send_error( uint8_t code, const char* msg );
 static void send_rx_packet( const uint8_t* payload, uint16_t len, int16_t rssi );
+/* Debug event frame: 'D' + len(6) + event_id:u8 + val:LE32. Host logs
+ * these as FW-DIAG lines. Event registry:
+ *   1 RX started | 2 TX requested | 3 TX submitting | 4 TX submit ok
+ *   5 TX packet done | 6 single packet RX | 7 CRC error | 8 TX complete
+ *   9 RX aborted for TX | 10/11 submit failures | 20 payload staged
+ *  22 TX-complete -> RX-restart gap (ms)
+ *  23 run_engine stall >20ms (ms) — usb_tx drain cost
+ *  24 hw-received-packets minus app-delivered (per stats interval)
+ *  25 LBT-busy occurrence */
+static void queue_host_tx( const uint8_t* p1, uint16_t l1, const uint8_t* p2, uint16_t l2,
+                           const uint8_t* p3, uint16_t l3 );
+static void send_debug_event( uint8_t event_id, uint32_t val )
+{
+    /* Only the low-frequency diagnostics (22-25) go on the wire: the
+     * legacy per-packet events (1-11, 20) fire per RX packet and flood
+     * the 3-deep host ring, dropping real traffic. */
+    if( event_id < 22 )
+    {
+        return;
+    }
+    uint8_t frame[3 + 6] = { 'D', 6, 0, 0, 0, 0, 0, 0, 0 };
+    frame[3] = event_id;
+    sys_put_le32( val, &frame[4] );
+    /* frame[8] = 0 (pad, already zeroed) */
+    queue_host_tx( frame, sizeof( frame ), NULL, 0, NULL, 0 );
+}
+
 static void send_stats_packet( void );
 static void send_time_packet( void );
-static inline void send_debug_event( uint8_t event_id, uint32_t val ) { ( void ) event_id; ( void ) val; }
+static void send_debug_event( uint8_t event_id, uint32_t val );
 static void rac_post_callback( rp_status_t status );
 static void start_burst_rx( void );
 static void request_burst_tx( void );
@@ -146,6 +174,14 @@ static uint8_t  g_tx_repeat_count = 0;
  * passed. Set by the LBT busy handler to a random future time so nodes that
  * deferred simultaneously don't collide again on retry. */
 static uint32_t g_tx_backoff_until_ms = 0;
+/* Timestamp of the last TX-complete (for the event-22 restart-gap measure). */
+static uint32_t g_last_tx_complete_ms = 0;
+/* Event-24 baselines: last hardware/app RX packet counts. */
+static uint32_t g_hw_rx_last = 0;
+static uint32_t g_app_rx_last = 0;
+/* Engine-loop instrumentation: superloop iteration start time and worst
+ * observed run_engine stall (event 23). */
+static uint32_t g_loop_iter_start_ms = 0;
 /* One-time flag: TxOnly radio needs to abort the initial RX once. */
 static bool     g_tx_only_rx_aborted = false;
 
@@ -410,9 +446,10 @@ static void send_rx_packet( const uint8_t* payload, uint16_t len, int16_t rssi )
 
 static void send_stats_packet( void )
 {
-    /* Extended stats: 24 bytes original + 16 bytes diagnostic = 40 bytes */
+    /* Extended stats: 48 bytes (16 counters + 12 diagnostic + MCU time +
+     * ring drops + staging overwrites). Bytes 44-47 reserved (zero). */
     uint8_t header[3] = { FLRC_MSG_STATS, 48, 0 };
-    uint8_t stats_bytes[48];
+    uint8_t stats_bytes[48] = { 0 };
     sys_put_le32( g_stats.bursts_tx, &stats_bytes[0] );
     sys_put_le32( g_stats.bursts_rx, &stats_bytes[4] );
     sys_put_le32( g_stats.packets_tx, &stats_bytes[8] );
@@ -472,6 +509,12 @@ static void start_burst_rx( void )
 
     g_rac_ctx->smtc_rac_data_buffer_setup.rx_payload_buffer = g_rac_rx_pkt_buf;
     g_rac_ctx->smtc_rac_data_buffer_setup.size_of_rx_payload_buffer = sizeof( g_rac_rx_pkt_buf );
+
+    if( g_last_tx_complete_ms != 0 )
+    {
+        send_debug_event( 22, smtc_modem_hal_get_time_in_ms( ) - g_last_tx_complete_ms );
+        g_last_tx_complete_ms = 0;
+    }
 
     g_rac_ctx->scheduler_config.scheduling    = SMTC_RAC_ASAP_TRANSACTION;
     /* Use current time — same fix as TX: prevents the 128s failsafe from
@@ -805,6 +848,7 @@ static void rac_post_callback( rp_status_t status )
          * exponentially with consecutive deferrals (binary exponential
          * backoff, capped at 64ms) to break persistent contention. */
         g_tx_repeat_count++;
+        send_debug_event( 25, g_tx_repeat_count );
         if( g_tx_repeat_count > 10 )
         {
             /* Channel persistently busy — drop this frame to avoid
@@ -858,6 +902,7 @@ static void rac_post_callback( rp_status_t status )
         {
             LOG_INF( "TX burst complete" );
             send_debug_event( 8, 0 ); /* Debug event 8: TX complete */
+            g_last_tx_complete_ms = smtc_modem_hal_get_time_in_ms( );
             send_ready( );
             g_pending_tx_valid   = false;
             g_pending_tx_len     = 0;
@@ -1130,6 +1175,17 @@ int main( void )
 
     while( true )
     {
+        /* Event 23: measure the PREVIOUS iteration's duration. A long
+         * iteration means smtc_rac_run_engine was not polled for that
+         * long — the engine-starvation signature (usb_tx drains, etc.). */
+        {
+            uint32_t now = smtc_modem_hal_get_time_in_ms( );
+            if( g_loop_iter_start_ms != 0 && now - g_loop_iter_start_ms > 20 )
+            {
+                send_debug_event( 23, now - g_loop_iter_start_ms );
+            }
+            g_loop_iter_start_ms = now;
+        }
         ( void ) usb_rx_poll( );
 
         if( g_radio_ok )
@@ -1197,6 +1253,20 @@ int main( void )
                 {
                     g_last_stats_emit_ms = now_ms;
                     send_stats_packet( );
+                    /* Event 24: hardware-received minus app-delivered packets
+                     * over this interval. Positive divergence = the radio
+                     * heard packets the engine never processed (starvation). */
+                    lr20xx_radio_flrc_rx_stats_t hw;
+                    lr20xx_radio_flrc_get_rx_stats(
+                        smtc_rac_get_radio_driver_context( ), &hw );
+                    uint32_t hw_delta = hw.received_packets - g_hw_rx_last;
+                    uint32_t app_delta = g_stats.packets_rx - g_app_rx_last;
+                    g_hw_rx_last = hw.received_packets;
+                    g_app_rx_last = g_stats.packets_rx;
+                    if( hw_delta > app_delta )
+                    {
+                        send_debug_event( 24, hw_delta - app_delta );
+                    }
                 }
             }
 
@@ -1206,14 +1276,26 @@ int main( void )
              * — so the radio is never blocked waiting on USB handoff. Draining
              * one frame at a time interleaves USB I/O with radio-engine polls,
              * bounding the gap between engine runs to a single frame's TX time
-             * (~1ms for a 430-byte proposal) instead of the whole queue.
+             * (~5ms for a 430-byte frame at the measured ~11.6us/B on the
+             * 921600-baud UART bridge) instead of the whole queue.
              *
              * CRITICAL: copy the frame to a local buffer before streaming.
-             * usb_tx takes ~77ms for an 877-byte frame. During that time,
+             * usb_tx takes ~10ms for an 877-byte frame at 921600 baud
+             * (the old "~77ms" figure was the 115200-baud era). During that time,
              * queue_host_tx (called from rac_post_callback inside
              * smtc_rac_run_engine) can overwrite the head slot if the ring
              * is full. Copying first prevents the producer from corrupting
              * data being streamed to the host. */
+            /* One frame per iteration. MEASUREMENT RESULT (events 23/24,
+             * chunked-drain experiments at 256B and 768B): chunking fixed
+             * engine stalls (161ms -> 25ms) and halved radio-level packet
+             * loss, but did NOT improve post-TX vote reception — the
+             * residual "deafness" is host-side serial latency (a 12KB
+             * frame takes ~130ms at the 11.6us/B UART; a 3-deep ring of
+             * them delays host-visible arrival 0.5-1.7s past the RF
+             * instant), which the 921600-baud wire fixes only with more
+             * bandwidth. Chunking also stretched ring drain and was
+             * functionally slower; reverted per gate discipline. */
             if( g_host_tx_head != g_host_tx_tail )
             {
                 uint16_t tx_len = g_host_tx_len[g_host_tx_head];
