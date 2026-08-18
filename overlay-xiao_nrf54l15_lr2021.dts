@@ -27,7 +27,7 @@
  * ~77ms to ~19ms, shrinking the window for ring buffer races and
  * reducing RAC engine starvation during USB drains. */
 &uart20 {
-    current-speed = <921600>;
+    current-speed = <1000000>;
 };
 
 /* ---- Enable the Xiao SPI bus that talks to the LR2021 ------------------- */
