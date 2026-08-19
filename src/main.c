@@ -243,26 +243,29 @@ static struct {
 } g_stats = { 0 };
 
 /* ----------------------------------------------------------------------------
- * Deferred host USB transfer queue.
+ * Deferred host UART transfer queue + dedicated TX consumer thread.
  *
  * The radio callback (rac_post_callback) runs inside smtc_rac_run_engine(),
- * which is polled in the main superloop. Doing the byte-polled USB CDC/UART
- * transfer (usb_tx) synchronously in the callback blocks the radio engine for
- * milliseconds per frame — the radio cannot re-arm RX (or start the next TX)
- * until the host handoff completes, which is the dominant source of TX/RX
- * turnaround latency on this half-duplex link.
+ * which is polled in the main superloop. Doing the byte-polled UART transfer
+ * (usb_tx) synchronously — in the callback OR in the superloop — blocks the
+ * radio engine for ~134ms per 12.4KB frame (measured: event-23 loop
+ * iterations of 143ms, event-24 hw-vs-app RX divergence of 23 packets: the
+ * radio HEARD peers' frames the engine never processed). With phase-locked
+ * multi-node traffic that starvation is fatal: a node transmitting in
+ * phase 3 goes blind to peers' proposals and phase-4 deliveries for the
+ * remainder of the window (observed 3.2s post-TX receive blackout).
  *
- * Instead, the callback copies the completed frame (header + payload + rssi,
- * or a READY/ERROR/STATS control frame) into this ring and returns immediately,
- * letting the radio state machine advance. The superloop drains the ring and
- * performs the (slow) USB transfer after smtc_rac_run_engine(), when the radio
- * is already settled. Single-threaded (callback + superloop both run in the
- * main thread), so the ring needs no lock.
+ * Correct pattern (symmetric with the RX ISR ring): producers (radio
+ * callback, command handler — both in the main thread) copy frames into
+ * this ring and post a semaphore; a DEDICATED lower-priority preemptible
+ * thread is the sole consumer, streaming slots to the UART while the main
+ * thread keeps polling the radio engine every ~1ms. The main loop no
+ * longer performs any UART TX work.
  *
- * Slot size covers realistic consensus traffic (block proposals ~430B, receipts,
- * state diffs). The full 24KB burst is only used by the host benchmark scripts;
- * oversized frames are dropped (counted in g_stats.host_tx_dropped) rather than
- * blocking the radio.
+ * Ownership: producers own `tail` (and may only append; on a full ring the
+ * NEW frame is dropped — never steal the consumer's head slot, which would
+ * race the consumer's in-flight copy). Consumer owns `head` exclusively.
+ * The semaphore provides the wakeup + ordering barrier.
  * ------------------------------------------------------------------------- */
 /* Hostbound (MCU→host) frame ring: 3 slots, each sized to carry a FULL
  * reassembled 12,288B RX frame (3B 'R' header + payload + 2B RSSI +
@@ -272,11 +275,18 @@ static struct {
 #define HOST_TX_SLOT_BYTES  12400
 static uint8_t  g_host_tx_buf[HOST_TX_QUEUE_DEPTH][HOST_TX_SLOT_BYTES];
 static uint16_t g_host_tx_len[HOST_TX_QUEUE_DEPTH];
-static volatile uint8_t g_host_tx_head;   /* superloop consumes (advances on drain) */
-static volatile uint8_t g_host_tx_tail;   /* callback produces (advances on queue) */
+static volatile uint8_t g_host_tx_head;   /* TX thread consumes (advances on drain) */
+static volatile uint8_t g_host_tx_tail;   /* main thread produces (advances on queue) */
 /* Scratch buffer for atomic frame drain: copied from the ring slot before
- * usb_tx streams it, so queue_host_tx can't overwrite mid-transfer. */
+ * usb_tx streams it, so queue_host_tx can't overwrite mid-transfer. Owned
+ * exclusively by the TX consumer thread. */
 static uint8_t  g_host_tx_scratch[HOST_TX_SLOT_BYTES];
+
+/* TX consumer thread: sole drainer of the host-TX ring. */
+static struct k_sem g_host_tx_sem;
+static void usb_tx_thread( void* p1, void* p2, void* p3 );
+static K_THREAD_STACK_DEFINE( usb_tx_thread_stack, 2048 );
+static struct k_thread usb_tx_thread_cb;
 
 /* USB parser state */
 typedef enum {
@@ -374,14 +384,14 @@ static int usb_tx( const uint8_t* data, uint16_t len )
 }
 
 /*
- * Stage a frame for deferred USB transfer to the host. Up to three segments
+ * Stage a frame for deferred UART transfer to the host. Up to three segments
  * (header / payload / trailer) are concatenated into one ring slot. Called
- * from rac_post_callback — never blocks on USB. If the frame won't fit a slot
- * or the ring is full, it is dropped and counted in g_stats.host_tx_dropped.
- *
- * The callback + superloop both run in the main thread (smtc_rac_run_engine
- * is polled inline), so head/tail need no lock; `volatile` only keeps the
- * compiler from caching them across k_yield().
+ * from rac_post_callback and usb_rx_poll (both main-thread context) — never
+ * blocks. If the frame won't fit a slot or the ring is full, it is dropped
+ * and counted in g_stats.host_tx_dropped. On a FULL ring the NEW frame is
+ * dropped (not the oldest): the consumer thread owns `head` exclusively,
+ * and stealing its in-flight slot from producer context would tear the
+ * frame being streamed.
  */
 static void queue_host_tx( const uint8_t* seg1, uint16_t len1,
                            const uint8_t* seg2, uint16_t len2,
@@ -397,10 +407,9 @@ static void queue_host_tx( const uint8_t* seg1, uint16_t len1,
     uint8_t next = (uint8_t)( ( g_host_tx_tail + 1 ) % HOST_TX_QUEUE_DEPTH );
     if( next == g_host_tx_head )
     {
-        /* Ring full — drop the oldest queued frame so the newest (most
-         * time-relevant consensus data) is kept. */
-        g_host_tx_head = (uint8_t)( ( g_host_tx_head + 1 ) % HOST_TX_QUEUE_DEPTH );
+        /* Ring full — drop this frame; the TX thread will catch up. */
         g_stats.host_tx_dropped++;
+        return;
     }
 
     uint8_t*  dst = g_host_tx_buf[g_host_tx_tail];
@@ -410,6 +419,35 @@ static void queue_host_tx( const uint8_t* seg1, uint16_t len1,
     if( len3 ) { memcpy( dst + off, seg3, len3 ); off += len3; }
     g_host_tx_len[g_host_tx_tail] = off;
     g_host_tx_tail = next;
+    k_sem_give( &g_host_tx_sem );
+}
+
+/*
+ * Dedicated UART TX consumer. Runs at the first preemptible priority, BELOW
+ * the (cooperative) main thread: it streams queued frames to the host only
+ * while the main thread sleeps between engine polls, so the radio engine is
+ * polled every ~1ms regardless of UART transfer length. This replaces the
+ * old in-superloop drain, whose ~134ms busy-poll per 12.4KB frame starved
+ * the engine (event-23 143ms iterations; event-24 hw-heard-but-unprocessed
+ * packets — the root cause of the 3.2s post-TX receive blackout).
+ */
+static void usb_tx_thread( void* p1, void* p2, void* p3 )
+{
+    ARG_UNUSED( p1 ); ARG_UNUSED( p2 ); ARG_UNUSED( p3 );
+
+    while( true )
+    {
+        k_sem_take( &g_host_tx_sem, K_FOREVER );
+        while( g_host_tx_head != g_host_tx_tail )
+        {
+            uint16_t tx_len = g_host_tx_len[g_host_tx_head];
+            /* Copy out of the ring slot BEFORE releasing it: the producer
+             * may reuse the slot the instant head advances. */
+            memcpy( g_host_tx_scratch, g_host_tx_buf[g_host_tx_head], tx_len );
+            g_host_tx_head = (uint8_t)( ( g_host_tx_head + 1 ) % HOST_TX_QUEUE_DEPTH );
+            ( void ) usb_tx( g_host_tx_scratch, tx_len );
+        }
+    }
 }
 
 static void send_ready( void )
@@ -473,7 +511,7 @@ static void send_time_packet( void )
     uint8_t pkt[5];
     pkt[0] = FLRC_MSG_TIME;
     sys_put_le32( smtc_modem_hal_get_time_in_ms( ), &pkt[1] );
-    ( void ) usb_tx( pkt, sizeof( pkt ) );
+    queue_host_tx( pkt, sizeof( pkt ), NULL, 0, NULL, 0 );
 }
 
 /* ========================================================================== *
@@ -1158,6 +1196,17 @@ int main( void )
 
     LOG_INF( "LR2021 FLRC hardware-burst bridge booting (burst_id offset: 0x%04X)", g_burst_id_offset );
 
+    /* Start the dedicated UART TX consumer thread BEFORE anything queues a
+     * hostbound frame (send_ready below): first preemptible priority, so it
+     * only runs while the main (cooperative) thread sleeps — the radio
+     * engine's poll cadence is never hostage to UART transfer length. */
+    k_sem_init( &g_host_tx_sem, 0, HOST_TX_QUEUE_DEPTH );
+    k_thread_create( &usb_tx_thread_cb, usb_tx_thread_stack,
+                     K_THREAD_STACK_SIZEOF( usb_tx_thread_stack ),
+                     usb_tx_thread, NULL, NULL, NULL,
+                     K_PRIO_PREEMPT( 0 ), 0, K_NO_WAIT );
+    k_thread_name_set( &usb_tx_thread_cb, "usb_tx" );
+
     if( usb_init( ) != 0 ) return 0;
     k_sleep( K_SECONDS( 1 ) );
 
@@ -1270,42 +1319,20 @@ int main( void )
                 }
             }
 
-            /* Drain ONE deferred host-TX frame per loop iteration, AFTER the
-             * radio engine has run. This performs the (slow) byte-polled USB
-             * transfer here in the superloop — never inside rac_post_callback
-             * — so the radio is never blocked waiting on USB handoff. Draining
-             * one frame at a time interleaves USB I/O with radio-engine polls,
-             * bounding the gap between engine runs to a single frame's TX time
-             * (~5ms for a 430-byte frame at the measured ~11.6us/B on the
-             * 921600-baud UART bridge) instead of the whole queue.
-             *
-             * CRITICAL: copy the frame to a local buffer before streaming.
-             * usb_tx takes ~10ms for an 877-byte frame at 921600 baud
-             * (the old "~77ms" figure was the 115200-baud era). During that time,
-             * queue_host_tx (called from rac_post_callback inside
-             * smtc_rac_run_engine) can overwrite the head slot if the ring
-             * is full. Copying first prevents the producer from corrupting
-             * data being streamed to the host. */
-            /* One frame per iteration. MEASUREMENT RESULT (events 23/24,
-             * chunked-drain experiments at 256B and 768B): chunking fixed
-             * engine stalls (161ms -> 25ms) and halved radio-level packet
-             * loss, but did NOT improve post-TX vote reception — the
-             * residual "deafness" is host-side serial latency (a 12KB
-             * frame takes ~130ms at the 11.6us/B UART; a 3-deep ring of
-             * them delays host-visible arrival 0.5-1.7s past the RF
-             * instant), which the 921600-baud wire fixes only with more
-             * bandwidth. Chunking also stretched ring drain and was
-             * functionally slower; reverted per gate discipline. */
-            if( g_host_tx_head != g_host_tx_tail )
-            {
-                uint16_t tx_len = g_host_tx_len[g_host_tx_head];
-                memcpy( g_host_tx_scratch, g_host_tx_buf[g_host_tx_head], tx_len );
-                g_host_tx_head = (uint8_t)( ( g_host_tx_head + 1 ) % HOST_TX_QUEUE_DEPTH );
-                ( void ) usb_tx( g_host_tx_scratch, tx_len );
-            }
+            /* Host-TX drain moved to the dedicated usb_tx_thread (see its
+             * comment): the superloop no longer performs ANY UART TX work.
+             * The old in-loop drain busy-polled ~134ms per 12.4KB frame,
+             * starving the radio engine (event-23 143ms iterations,
+             * event-24 hw-heard-but-unprocessed packets) — the measured
+             * cause of the post-TX receive blackout. */
         }
 
-        k_yield( );
+        /* Sleep, not k_yield: the main thread is cooperative, and the TX
+         * consumer runs at the first preemptible priority — it only gets
+         * the CPU while we sleep. 1ms bounds both the engine-poll gap and
+         * the RX-ring service latency (~125 bytes at 1M baud, trivially
+         * inside the 8KB ring). */
+        k_msleep( 1 );
     }
 
     return 0;
