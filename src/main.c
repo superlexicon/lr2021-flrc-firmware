@@ -1349,7 +1349,21 @@ int main( void )
                     g_app_rx_last = g_stats.packets_rx;
                     if( hw_delta > app_delta )
                     {
-                        send_debug_event( 24, hw_delta - app_delta );
+                        uint32_t gap = hw_delta - app_delta;
+                        send_debug_event( 24, gap );
+                        /* Event 29/30: correlate the unsurfaced-packet gap
+                         * with our own TX activity. Event 29 = gap size;
+                         * event 30 = ms since our last TX-complete at the
+                         * moment the gap was detected (small values => the
+                         * packets died in our own abort/handoff/air/restart
+                         * deaf window; large values => a different
+                         * mechanism). */
+                        send_debug_event( 29, gap );
+                        send_debug_event(
+                            30,
+                            g_last_tx_complete_ms == 0
+                                ? 0xFFFFFFFF
+                                : smtc_modem_hal_get_time_in_ms( ) - g_last_tx_complete_ms );
                     }
                 }
             }
