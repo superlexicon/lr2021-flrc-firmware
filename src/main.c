@@ -179,6 +179,9 @@ static uint32_t g_last_tx_complete_ms = 0;
 /* Event-24 baselines: last hardware/app RX packet counts. */
 static uint32_t g_hw_rx_last = 0;
 static uint32_t g_app_rx_last = 0;
+/* Latest hardware FLRC RX stats snapshot (chip-level counters: includes
+ * per-packet CRC/length failures the app callbacks never see). */
+static lr20xx_radio_flrc_rx_stats_t g_hw_rx_stats = { 0 };
 /* Engine-loop instrumentation: superloop iteration start time and worst
  * observed run_engine stall (event 23). */
 static uint32_t g_loop_iter_start_ms = 0;
@@ -485,10 +488,12 @@ static void send_rx_packet( const uint8_t* payload, uint16_t len, int16_t rssi )
 
 static void send_stats_packet( void )
 {
-    /* Extended stats: 48 bytes (16 counters + 12 diagnostic + MCU time +
-     * ring drops + staging overwrites). Bytes 44-47 reserved (zero). */
-    uint8_t header[3] = { FLRC_MSG_STATS, 48, 0 };
-    uint8_t stats_bytes[48] = { 0 };
+    /* Extended stats: 64 bytes (48 prior + chip-level FLRC RX counters).
+     * The chip counters see per-packet CRC/length failures that never
+     * reach app callbacks — the discriminator between RF-level packet
+     * corruption and deeper drops. */
+    uint8_t header[3] = { FLRC_MSG_STATS, 64, 0 };
+    uint8_t stats_bytes[64] = { 0 };
     sys_put_le32( g_stats.bursts_tx, &stats_bytes[0] );
     sys_put_le32( g_stats.bursts_rx, &stats_bytes[4] );
     sys_put_le32( g_stats.packets_tx, &stats_bytes[8] );
@@ -505,6 +510,10 @@ static void send_stats_packet( void )
     sys_put_le32( g_rx_ring_dropped, &stats_bytes[36] ); /* UART RX ring drops (must stay 0) */
     sys_put_le32( g_staging_overwrites, &stats_bytes[40] ); /* TX queue overruns (must stay 0) */
     sys_put_le32( g_stats.burst_id_conflicts, &stats_bytes[44] ); /* burst-id collisions (see slot matching) */
+    sys_put_le32( g_hw_rx_stats.received_packets, &stats_bytes[48] ); /* chip: all RX'd */
+    sys_put_le32( g_hw_rx_stats.crc_errors,       &stats_bytes[52] ); /* chip: hw CRC fail */
+    sys_put_le32( g_hw_rx_stats.length_errors,    &stats_bytes[56] ); /* chip: hw length fail */
+    sys_put_le32( g_hw_rx_stats.crc_ok,           &stats_bytes[60] ); /* chip: hw CRC ok */
     queue_host_tx( header, 3, stats_bytes, sizeof( stats_bytes ), NULL, 0 );
 }
 
@@ -1326,13 +1335,14 @@ int main( void )
                 if( now_ms - g_last_stats_emit_ms >= STATS_EMIT_INTERVAL_MS )
                 {
                     g_last_stats_emit_ms = now_ms;
-                    send_stats_packet( );
                     /* Event 24: hardware-received minus app-delivered packets
                      * over this interval. Positive divergence = the radio
                      * heard packets the engine never processed (starvation). */
                     lr20xx_radio_flrc_rx_stats_t hw;
                     lr20xx_radio_flrc_get_rx_stats(
                         smtc_rac_get_radio_driver_context( ), &hw );
+                    g_hw_rx_stats = hw;
+                    send_stats_packet( );
                     uint32_t hw_delta = hw.received_packets - g_hw_rx_last;
                     uint32_t app_delta = g_stats.packets_rx - g_app_rx_last;
                     g_hw_rx_last = hw.received_packets;
