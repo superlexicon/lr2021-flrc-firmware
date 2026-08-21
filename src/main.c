@@ -240,6 +240,7 @@ static struct {
     uint32_t packets_rx;
     uint32_t crc_errors;
     uint32_t host_tx_dropped;   /* deferred host-TX frames dropped (queue full / too big) */
+    uint32_t burst_id_conflicts; /* RX packets whose burst_id matched a slot held by a DIFFERENT burst (per-node counter + boot-random XOR offsets collide) */
 } g_stats = { 0 };
 
 /* ----------------------------------------------------------------------------
@@ -503,6 +504,7 @@ static void send_stats_packet( void )
     sys_put_le32( smtc_modem_hal_get_time_in_ms( ), &stats_bytes[32] );  /* current MCU time */
     sys_put_le32( g_rx_ring_dropped, &stats_bytes[36] ); /* UART RX ring drops (must stay 0) */
     sys_put_le32( g_staging_overwrites, &stats_bytes[40] ); /* TX queue overruns (must stay 0) */
+    sys_put_le32( g_stats.burst_id_conflicts, &stats_bytes[44] ); /* burst-id collisions (see slot matching) */
     queue_host_tx( header, 3, stats_bytes, sizeof( stats_bytes ), NULL, 0 );
 }
 
@@ -770,8 +772,31 @@ static void rac_post_callback( rp_status_t status )
                 {
                     if( g_rx_slots[i].active && g_rx_slots[i].burst_id == burst_id )
                     {
-                        slot = &g_rx_slots[i];
-                        break;
+                        /* TUPLE KEY (2026-08-22 bench forensics): the slot
+                         * must belong to THIS burst, not merely share its
+                         * 16-bit id. burst_ids are per-node counters XOR'd
+                         * with a boot-random offset — two nodes collide
+                         * regularly, and id-only matching fed the second
+                         * sender's packets into the first sender's
+                         * incomplete slot: received_count never reached
+                         * total_packets, the burst rotted until timeout,
+                         * while packets_rx counted every packet (event-24
+                         * hw-rx-not-app-delivered matched the lost-burst
+                         * packet counts exactly; delivery was bimodal per
+                         * pair — 99% vs 16-20% — re-randomized every
+                         * reboot). The payload CRC32 makes a cross-sender
+                         * tuple match implausible. */
+                        if( g_rx_slots[i].total_packets == total_packets &&
+                            g_rx_slots[i].payload_len   == total_payload_len &&
+                            g_rx_slots[i].payload_crc   == payload_crc32 )
+                        {
+                            slot = &g_rx_slots[i];
+                            break;
+                        }
+                        g_stats.burst_id_conflicts++;
+                        send_debug_event( 26, burst_id );
+                        /* Different sender's burst under the same id — it
+                         * takes its own slot below. */
                     }
                     if( !g_rx_slots[i].active && free_idx < 0 )
                     {
