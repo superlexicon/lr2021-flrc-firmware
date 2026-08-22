@@ -883,7 +883,31 @@ static void rac_post_callback( rp_status_t status )
                             send_rx_packet( slot->reassembly_buf,
                                             ( uint16_t ) slot->payload_len,
                                             slot->last_rssi );
-                            smtc_rac_flrc_burst_rx_done( g_radio_access_id );
+                            /* DO NOT call smtc_rac_flrc_burst_rx_done() here.
+                             * It unlocks the radio access — terminating the
+                             * RX TRANSACTION — and the transaction is the
+                             * only thing that harvests packets into
+                             * RP_STATUS_RX_PACKET callbacks. Every burst
+                             * completion therefore opened a restart gap
+                             * (unlock → RADIO_UNLOCKED → restart_pending →
+                             * new ASAP transaction) during which the chip's
+                             * demod kept counting arrivals the RAC never
+                             * surfaced — the measured ~12% hwrx−prx gap
+                             * (2026-08-22 bench, all three nodes; gap
+                             * ≈ bursts/sec × restart_ms). The completions
+                             * are phase-correlated, so each node's gap
+                             * landed on the same peers' slots every window
+                             * — the stable per-direction loss pattern.
+                             * The transaction is DESIGNED for continuous
+                             * RX (burst_rx_size = full range, 60s timeout
+                             * margin) and harvests many bursts; direct
+                             * evidence: the directed test (no reassembly
+                             * completions → no rx_done → transaction lived
+                             * 60s) received continuously. The ~66s active
+                             * timeout ends the transaction via
+                             * RP_STATUS_TASK_ABORTED, which already sets
+                             * restart_rx_pending. TX still preempts via
+                             * request_burst_tx()'s explicit abort. */
                         }
                         else
                         {
@@ -1349,21 +1373,20 @@ int main( void )
                     g_app_rx_last = g_stats.packets_rx;
                     if( hw_delta > app_delta )
                     {
+                        /* ONE combined event (the triple 24/29/30 emission
+                         * flooded the 3-deep host-TX ring and crowded out
+                         * control frames). Value packs the gap size in the
+                         * high 16 bits and the ms-since-last-TX-complete
+                         * (capped) in the low 16 — small TX distances mean
+                         * the packets died in our own abort/air/restart
+                         * window. 0xFFFFFFFF-32+... reserved: use
+                         * 0x0000FFFF as "no TX since boot". */
                         uint32_t gap = hw_delta - app_delta;
-                        send_debug_event( 24, gap );
-                        /* Event 29/30: correlate the unsurfaced-packet gap
-                         * with our own TX activity. Event 29 = gap size;
-                         * event 30 = ms since our last TX-complete at the
-                         * moment the gap was detected (small values => the
-                         * packets died in our own abort/handoff/air/restart
-                         * deaf window; large values => a different
-                         * mechanism). */
-                        send_debug_event( 29, gap );
-                        send_debug_event(
-                            30,
-                            g_last_tx_complete_ms == 0
-                                ? 0xFFFFFFFF
-                                : smtc_modem_hal_get_time_in_ms( ) - g_last_tx_complete_ms );
+                        uint32_t tdist = ( g_last_tx_complete_ms == 0 )
+                            ? 0xFFFF
+                            : ( smtc_modem_hal_get_time_in_ms( ) - g_last_tx_complete_ms );
+                        if( tdist > 0xFFFE ) tdist = 0xFFFE;
+                        send_debug_event( 24, ( gap << 16 ) | tdist );
                     }
                 }
             }
