@@ -176,6 +176,8 @@ static uint8_t  g_tx_repeat_count = 0;
 static uint32_t g_tx_backoff_until_ms = 0;
 /* Timestamp of the last TX-complete (for the event-22 restart-gap measure). */
 static uint32_t g_last_tx_complete_ms = 0;
+/* Non-consuming copy for the periodic stats-tick event-24 correlation. */
+static uint32_t g_last_tx_complete_persist_ms = 0;
 /* Event-24 baselines: last hardware/app RX packet counts. */
 static uint32_t g_hw_rx_last = 0;
 static uint32_t g_app_rx_last = 0;
@@ -554,7 +556,15 @@ static void start_burst_rx( void )
     p->max_rx_size               = FLRC_BURST_PKT_PAYLOAD;
     p->burst_rx_size             = FLRC_BURST_MAX_TOTAL_PAYLOAD; /* 24576 — RAC needs full range for continuous RX */
     p->rx_burst_timeout_margin_ms = 60000; /* 60s — keeps RAC in continuous RX */
-    p->min_interframe_delay_us = 300;
+    /* TX inter-packet pacing must exceed the RECEIVER's engine-poll
+     * granularity (~1ms in the peer's superloop): at 300us spacing,
+     * back-to-back packets in a burst completed within one poll interval
+     * and the second died in the chip's RX buffer — counted by
+     * hw.received_packets, never drained to RP_STATUS_RX_PACKET (the
+     * steady 1-4 packets/10s unsurfaced drip on every node, worse for
+     * longer bursts = the per-direction loss asymmetry). 1200us clears
+     * the poll race with margin; a 4-packet burst still airs in <7ms. */
+    p->min_interframe_delay_us = 1200;
 
     g_rac_ctx->smtc_rac_data_buffer_setup.rx_payload_buffer = g_rac_rx_pkt_buf;
     g_rac_ctx->smtc_rac_data_buffer_setup.size_of_rx_payload_buffer = sizeof( g_rac_rx_pkt_buf );
@@ -562,6 +572,10 @@ static void start_burst_rx( void )
     if( g_last_tx_complete_ms != 0 )
     {
         send_debug_event( 22, smtc_modem_hal_get_time_in_ms( ) - g_last_tx_complete_ms );
+        /* PERSISTENT COPY for the stats-tick event-24 correlation: the
+         * one-shot measure resets the source, which made every event-24
+         * tx-distance read the "no TX since boot" sentinel. */
+        g_last_tx_complete_persist_ms = g_last_tx_complete_ms;
         g_last_tx_complete_ms = 0;
     }
 
@@ -659,7 +673,15 @@ static void execute_burst_tx( void )
     p->sync_word[2]      = default_syncword_3;
     p->crc_seed          = 0xFFFFFFFF;
     p->crc_polynomial    = 0x755B;
-    p->min_interframe_delay_us = 300;
+    /* TX inter-packet pacing must exceed the RECEIVER's engine-poll
+     * granularity (~1ms in the peer's superloop): at 300us spacing,
+     * back-to-back packets in a burst completed within one poll interval
+     * and the second died in the chip's RX buffer — counted by
+     * hw.received_packets, never drained to RP_STATUS_RX_PACKET (the
+     * steady 1-4 packets/10s unsurfaced drip on every node, worse for
+     * longer bursts = the per-direction loss asymmetry). 1200us clears
+     * the poll race with margin; a 4-packet burst still airs in <7ms. */
+    p->min_interframe_delay_us = 1200;
     p->max_rx_size       = FLRC_BURST_PKT_PAYLOAD;
     p->burst_tx_size     = g_tx_air_total_len;
 
@@ -1382,9 +1404,9 @@ int main( void )
                          * window. 0xFFFFFFFF-32+... reserved: use
                          * 0x0000FFFF as "no TX since boot". */
                         uint32_t gap = hw_delta - app_delta;
-                        uint32_t tdist = ( g_last_tx_complete_ms == 0 )
+                        uint32_t tdist = ( g_last_tx_complete_persist_ms == 0 )
                             ? 0xFFFF
-                            : ( smtc_modem_hal_get_time_in_ms( ) - g_last_tx_complete_ms );
+                            : ( smtc_modem_hal_get_time_in_ms( ) - g_last_tx_complete_persist_ms );
                         if( tdist > 0xFFFE ) tdist = 0xFFFE;
                         send_debug_event( 24, ( gap << 16 ) | tdist );
                     }
@@ -1401,10 +1423,11 @@ int main( void )
 
         /* Sleep, not k_yield: the main thread is cooperative, and the TX
          * consumer runs at the first preemptible priority — it only gets
-         * the CPU while we sleep. 1ms bounds both the engine-poll gap and
-         * the RX-ring service latency (~125 bytes at 1M baud, trivially
-         * inside the 8KB ring). */
-        k_msleep( 1 );
+         * the CPU while we sleep. 250us bounds the engine-poll gap (the
+         * RX-drain race that ate back-to-back burst packets at the old
+         * 1ms granularity) and the RX-ring service latency (~31 bytes at
+         * 1M baud, trivially inside the 8KB ring). */
+        k_usleep( 250 );
     }
 
     return 0;
